@@ -19,15 +19,20 @@ A multi-agent orchestrator that drives Claude Code subprocesses toward a user-de
 ```bash
 uv sync
 
-# subprocess runner (day 1)
+# CLI subprocess runner (day 1)
 uv run python -m pm_agent.runner "what is 2+2"
 uv run python -m pm_agent.runner "review this code" --role "You are a senior code reviewer."
 
-# TUI skeleton (day 2 — mock data only, q to quit)
+# TUI mock mode (day 2 — fake data, q to quit)
 uv run python -m pm_agent.tui
+
+# TUI real mode (day 3-4 — spawn claude -p and stream into right panel)
+uv run python -m pm_agent.tui "say only the word four"
 ```
 
-Day 2 TUI snapshot: `docs/tui-day2-snapshot.svg`
+Snapshots:
+- `docs/tui-day2-snapshot.svg` — mock layout
+- `docs/tui-day3-real-snapshot.svg` — real claude streaming, 4 events, $0.057
 
 ## Day 1 known issues / mitigations
 

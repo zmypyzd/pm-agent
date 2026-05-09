@@ -1,30 +1,42 @@
-"""TUI skeleton for pm-agent (day 2, task 1).
+"""TUI for pm-agent.
 
-Five panels per design doc:
+Two modes:
+
+  1. Mock mode (no argv): the day-2 skeleton with mock data + ticker.
+     Useful for verifying layout without burning API calls.
+       uv run python -m pm_agent.tui
+
+  2. Real mode (goal as argv): day-3/4 wiring. Spawns one `claude -p`
+     subprocess via run_claude_async(), streams parsed events into the
+     right panel, updates cost/duration in the footer, marks Coder-1 as
+     running/done in the center panel.
+       uv run python -m pm_agent.tui "what is 2+2 in one word"
+
+Five panels (per design doc):
   top    — goal + progress bar
-  left   — task list / DAG
+  left   — task table
   center — agent status cards
-  right  — live log stream
-  bottom — cost / tokens / elapsed time
+  right  — RichLog stream of subprocess output
+  bottom — cost / events / elapsed
 
-Mock data only at this stage. Real subprocess wiring lands day 3-4.
-A 0.8s ticker advances mock log + progress so we can confirm the TUI
-isn't frozen and refresh works.
-
-Run: `uv run python -m pm_agent.tui`     (q to quit)
+q to quit.
 """
 from __future__ import annotations
 
+import sys
 import time
 from datetime import timedelta
 
+from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Label, ProgressBar, RichLog, Static
 
-GOAL_MOCK = "Add room invite link API to werewolf platform"
+from pm_agent.runner import run_claude_async
 
-AGENTS_MOCK = [
+GOAL_MOCK = "Add room invite link API to werewolf platform (mock)"
+
+AGENTS_INITIAL = [
     ("Planner",  "done",     "Decomposed into 3 tasks"),
     ("Coder-1",  "running",  "Editing server/rooms/api.py"),
     ("Coder-2",  "running",  "Writing tests for invite expiry"),
@@ -49,7 +61,7 @@ MOCK_LOG_LINES = [
 
 
 class PMAgentTUI(App):
-    """Day-2 skeleton — mock data only, demonstrates layout + ticker."""
+    """Day-3/4 wiring: mock mode + real-claude streaming mode."""
 
     CSS = """
     Screen { layout: vertical; }
@@ -102,10 +114,19 @@ class PMAgentTUI(App):
 
     _start_time: float = 0.0
     _tick_counter: int = 0
+    _event_count: int = 0
+    _cost_usd: float = 0.0
+    _streamed_text: str = ""
+
+    def __init__(self, goal: str | None = None) -> None:
+        super().__init__()
+        self.goal = goal
+        self.is_mock = goal is None
 
     def compose(self) -> ComposeResult:
+        display_goal = self.goal if self.goal else f"{GOAL_MOCK}"
         with Vertical(id="goal-bar"):
-            yield Label(f"Goal: {GOAL_MOCK}", id="goal")
+            yield Label(f"Goal: {display_goal}", id="goal")
             yield ProgressBar(total=100, show_eta=False, id="progress")
         with Horizontal(id="main"):
             with Vertical(id="left"):
@@ -113,27 +134,37 @@ class PMAgentTUI(App):
                 yield DataTable(id="tasks", show_header=True, zebra_stripes=True)
             with Vertical(id="center"):
                 yield Static("Active Agents", classes="panel-title")
-                for name, status, action in AGENTS_MOCK:
+                for name, status, action in AGENTS_INITIAL:
                     yield Static(
                         f"[bold]{name}[/]\n[dim]{action}[/]",
+                        id=f"agent-{name}",
                         classes=f"agent-card status-{status}",
                     )
             with Vertical(id="right"):
                 yield Static("Live Log", classes="panel-title")
                 yield RichLog(id="logs", wrap=True, highlight=True, markup=True)
-        yield Static(self._footer_text(0.0, 0, 0.0), id="footer-bar")
+        yield Static(self._footer_text(0.0, 0, 0.0, "events"), id="footer-bar")
 
     def on_mount(self) -> None:
         self._start_time = time.time()
         table = self.query_one("#tasks", DataTable)
         table.add_columns("ID", "Task", "Status")
-        for tid, title, status in TASKS_MOCK:
-            table.add_row(tid, title, status)
+        if self.is_mock:
+            for row in TASKS_MOCK:
+                table.add_row(*row)
+        else:
+            table.add_row("T-1", (self.goal or "")[:40], "running")
         log = self.query_one("#logs", RichLog)
-        log.write("[green]pm-agent TUI started[/]")
-        log.write(f"[dim]goal:[/] {GOAL_MOCK}")
-        self.set_interval(0.8, self._tick)
+        if self.is_mock:
+            log.write("[green]pm-agent TUI started (mock mode)[/]")
+            log.write(f"[dim]goal:[/] {GOAL_MOCK}")
+            self.set_interval(0.8, self._tick)
+        else:
+            log.write("[green]pm-agent TUI started (real mode)[/]")
+            log.write(f"[dim]goal:[/] {self.goal}")
+            self._stream_real()
 
+    # ---------- mock mode ----------
     def _tick(self) -> None:
         log = self.query_one("#logs", RichLog)
         progress = self.query_one("#progress", ProgressBar)
@@ -141,27 +172,85 @@ class PMAgentTUI(App):
 
         log.write(MOCK_LOG_LINES[self._tick_counter % len(MOCK_LOG_LINES)])
         self._tick_counter += 1
-
         progress.update(progress=min(100, self._tick_counter * 4))
-
         elapsed = time.time() - self._start_time
         cost = 0.012 * self._tick_counter
         tokens = 320 * self._tick_counter
-        footer.update(self._footer_text(cost, tokens, elapsed))
+        footer.update(self._footer_text(cost, tokens, elapsed, "tokens"))
+
+    # ---------- real mode ----------
+    @work(exclusive=True)
+    async def _stream_real(self) -> None:
+        log = self.query_one("#logs", RichLog)
+        progress = self.query_one("#progress", ProgressBar)
+        footer = self.query_one("#footer-bar", Static)
+
+        # Reset agent cards: only Coder-1 active for single-subprocess demo.
+        self._set_agent_status("Planner",  "done",    "Goal accepted")
+        self._set_agent_status("Coder-1",  "running", "Streaming claude -p")
+        self._set_agent_status("Coder-2",  "idle",    "(parallel agents — day 5+)")
+        self._set_agent_status("Reviewer", "idle",    "(needs result — day 5+)")
+
+        log.write(f"[cyan]→ spawning claude -p[/] {self.goal!r}")
+
+        async for ev in run_claude_async(self.goal or ""):
+            self._event_count += 1
+            et, st = ev.get("type"), ev.get("subtype")
+
+            if et == "system" and st == "init":
+                sid = (ev.get("session_id") or "")[:8]
+                log.write(f"[dim]session={sid} model={ev.get('model')}[/]")
+            elif et == "assistant":
+                for part in ev.get("message", {}).get("content", []):
+                    if part.get("type") == "text":
+                        text = part["text"]
+                        self._streamed_text += text
+                        log.write(text)
+            elif et == "result":
+                cost = ev.get("total_cost_usd")
+                dur = ev.get("duration_ms")
+                self._cost_usd = float(cost) if cost is not None else 0.0
+                log.write(
+                    f"[bold green]✓ result[/] cost=${self._cost_usd:.4f} "
+                    f"dur={dur}ms turns={ev.get('num_turns')}"
+                )
+                progress.update(progress=100)
+                self._set_agent_status("Coder-1", "done", "Subprocess finished")
+            elif et == "system" and st == "notification":
+                log.write(f"[yellow]⚠ {ev.get('text')}[/]")
+
+            elapsed = time.time() - self._start_time
+            footer.update(
+                self._footer_text(self._cost_usd, self._event_count, elapsed, "events")
+            )
+
+        log.write("[bold green]done[/]")
+
+    def _set_agent_status(self, name: str, status: str, action: str) -> None:
+        try:
+            card = self.query_one(f"#agent-{name}", Static)
+        except Exception:
+            return
+        card.update(f"[bold]{name}[/]\n[dim]{action}[/]")
+        # Replace status class
+        for cls in ("status-running", "status-done", "status-idle", "status-blocked"):
+            card.remove_class(cls)
+        card.add_class(f"status-{status}")
 
     @staticmethod
-    def _footer_text(cost: float, tokens: int, elapsed: float) -> str:
+    def _footer_text(cost: float, count: int, elapsed: float, count_label: str) -> str:
         elapsed_str = str(timedelta(seconds=int(elapsed)))
         return (
             f"cost: [bold green]${cost:.4f}[/]   "
-            f"tokens: [bold cyan]{tokens:,}[/]   "
+            f"{count_label}: [bold cyan]{count:,}[/]   "
             f"elapsed: [bold]{elapsed_str}[/]   "
             f"|   [dim]q to quit[/]"
         )
 
 
 def main() -> None:
-    PMAgentTUI().run()
+    goal = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else None
+    PMAgentTUI(goal=goal).run()
 
 
 if __name__ == "__main__":

@@ -1,20 +1,30 @@
-"""Minimal `claude -p` subprocess runner with stream-json parsing.
+"""`claude -p` subprocess runner with stream-json parsing.
 
-Day 1 spike: prove we can spawn claude non-interactively, parse NDJSON
-event-by-event, extract assistant text and final cost. This is the kernel
-the rest of the orchestrator will be built on.
+Two flavors share one cmd builder:
+
+  - run_claude_async() — async generator, yields parsed events one by one.
+    Used by the TUI worker. Keeps Textual's event loop responsive.
+  - run_claude() — sync wrapper. Collects events into a RunResult.
+    Used by the CLI.
+
+Both default to isolate=True, which adds --setting-sources project,local.
+That skips user-level ~/.claude/settings.json (where global hooks live —
+laziness-self-report, teamagent, etc) so spawned children produce clean
+output and run ~3x cheaper than the default Claude Code session loader.
 
 Usage:
     python -m pm_agent.runner "what is 2+2"
-    python -m pm_agent.runner "review this diff" --role "You are a code reviewer."
+    python -m pm_agent.runner "review this diff" --role "Senior code reviewer."
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import subprocess
 import sys
 from dataclasses import dataclass
+from typing import AsyncIterator
 
 
 @dataclass
@@ -26,19 +36,52 @@ class RunResult:
     exit_code: int
 
 
-def run_claude(
-    prompt: str, role: str | None = None, isolate: bool = True
-) -> RunResult:
+def _build_cmd(prompt: str, role: str | None, isolate: bool) -> list[str]:
     cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose"]
     if isolate:
-        # Skip user-level settings (~/.claude/settings.json). This drops the
-        # parent session's hooks (laziness-self-report, teamagent SessionStart,
-        # etc) without affecting auth (keychain still works) or model defaults.
-        # Side benefit: ~70% cost & latency reduction per call vs full settings.
+        # Skip user-level settings (~/.claude/settings.json). Drops parent's
+        # global hooks; keeps keychain auth and model defaults. ~70% cost &
+        # latency reduction per call vs default loader.
         cmd += ["--setting-sources", "project,local"]
     if role:
         cmd += ["--append-system-prompt", role]
+    return cmd
 
+
+async def run_claude_async(
+    prompt: str, role: str | None = None, isolate: bool = True
+) -> AsyncIterator[dict]:
+    """Spawn claude -p and yield each parsed stream-json event as a dict.
+
+    Caller drives consumption rate. Errors during parse are swallowed so a
+    malformed line doesn't kill the stream.
+    """
+    cmd = _build_cmd(prompt, role, isolate)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert proc.stdout is not None
+    while True:
+        raw = await proc.stdout.readline()
+        if not raw:
+            break
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line:
+            continue
+        try:
+            yield json.loads(line)
+        except json.JSONDecodeError:
+            continue
+    await proc.wait()
+
+
+def run_claude(
+    prompt: str, role: str | None = None, isolate: bool = True
+) -> RunResult:
+    """Sync runner. Streams events to stdout/stderr and returns a summary."""
+    cmd = _build_cmd(prompt, role, isolate)
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
     )
