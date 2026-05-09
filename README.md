@@ -18,14 +18,16 @@ A multi-agent orchestrator that drives Claude Code subprocesses toward a user-de
 
 ```bash
 uv sync
-uv run pm-agent run "<your dev goal here>"
+uv run python -m pm_agent.runner "what is 2+2"
+uv run python -m pm_agent.runner "review this code" --role "You are a senior code reviewer."
 ```
 
 ## Day 1 known issues / mitigations
 
-- `claude -p "hello"` baseline cost: $0.17 (40k token system prompt overhead).
-  Mitigation: use `--append-system-prompt` per role, not default; consider Anthropic SDK direct.
-- Hook inheritance: spawned `claude -p` inherits all `~/.claude/settings.json` hooks.
-  Mitigation TBD: clean HOME or `--no-settings` flag.
-- `~/.teamagent/hooks/bin-session-start.cjs` is broken (missing `web-tree-sitter`).
-  Pollutes stream-json output. Fix: `cd ~/.teamagent && npm i web-tree-sitter`, or disable hook.
+- **[CONFIRMED]** Baseline cost per `claude -p` invocation: ~$0.17 (40k token system prompt overhead).
+  Mitigation: use `--append-system-prompt` per role; for production demo consider Anthropic SDK direct (skips Claude Code session loader).
+- **[CONFIRMED, OPEN]** Hook inheritance: spawned `claude -p` inherits all `~/.claude/settings.json` hooks.
+  Verified: parent session's `laziness-self-report` stop-hook injected into child's output, **replaced the real answer**.
+  Mitigation TBD: clean HOME or `--no-settings` flag for child processes.
+- **[FIXED 2026-05-09]** `~/.teamagent/hooks/bin-session-start.cjs` no longer errors.
+  Was: `Cannot find module 'web-tree-sitter'`. Fix applied: `cd ~/.teamagent && npm i web-tree-sitter`.
