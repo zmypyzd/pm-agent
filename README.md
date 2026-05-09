@@ -18,9 +18,16 @@ A multi-agent orchestrator that drives Claude Code subprocesses toward a user-de
 
 ```bash
 uv sync
+
+# subprocess runner (day 1)
 uv run python -m pm_agent.runner "what is 2+2"
 uv run python -m pm_agent.runner "review this code" --role "You are a senior code reviewer."
+
+# TUI skeleton (day 2 — mock data only, q to quit)
+uv run python -m pm_agent.tui
 ```
+
+Day 2 TUI snapshot: `docs/tui-day2-snapshot.svg`
 
 ## Day 1 known issues / mitigations
 
