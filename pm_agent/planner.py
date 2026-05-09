@@ -225,6 +225,7 @@ async def plan(
     repo: Path,
     max_retries: int = 2,
     on_retry: "Callable[[int, str], None] | None" = None,
+    simulate_failures: int = 0,
 ) -> tuple[list[CoderTask], float]:
     """Run the planner with up to `max_retries` self-correcting attempts.
 
@@ -232,13 +233,26 @@ async def plan(
     user prompt, asking claude to fix it. Cost accumulates across attempts.
     `on_retry(attempt_num, last_error)` fires before each retry attempt
     (1-indexed). Final failure raises PlannerError with cumulative context.
+
+    `simulate_failures` (Day 11 fault injection): the first N attempts skip
+    the claude call entirely and synthesize malformed YAML so the retry +
+    fallback path can be demoed deterministically and for free.
     """
     total_cost = 0.0
     last_error: str | None = None
     for attempt in range(max_retries + 1):
         if attempt > 0 and on_retry is not None:
             on_retry(attempt, last_error or "(unknown)")
-        text, cost = await _call_planner_once(goal, repo, retry_feedback=last_error)
+        if attempt < simulate_failures:
+            # Inject a deterministic, free, parser-tripping payload.
+            text, cost = (
+                "```yaml\ntasks: `[broken inline {with: brackets}]`\n```",
+                0.0,
+            )
+        else:
+            text, cost = await _call_planner_once(
+                goal, repo, retry_feedback=last_error
+            )
         total_cost += cost
         if not text.strip():
             last_error = "planner returned empty response"

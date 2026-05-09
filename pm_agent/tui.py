@@ -212,6 +212,7 @@ class PMAgentTUI(App):
         use_real_planner: bool = True,
         test_cmd: str | None = None,
         coder_timeout: float = 180.0,
+        inject_fault: str | None = None,
     ) -> None:
         super().__init__()
         self.goal = goal
@@ -221,6 +222,9 @@ class PMAgentTUI(App):
         self.test_cmd = test_cmd
         self.coder_timeout = coder_timeout
         self.repo = repo
+        # Day 11: fault injection for the recovery-flow demo. None = normal run.
+        # Valid values: "planner-yaml", "coder-timeout", "api-error".
+        self.inject_fault = inject_fault
         self.wm: WorktreeManager | None = None
         if not self.is_mock and repo is not None:
             self.wm = WorktreeManager(repo)
@@ -234,8 +238,11 @@ class PMAgentTUI(App):
 
     def compose(self) -> ComposeResult:
         display_goal = self.goal if self.goal else GOAL_MOCK
+        goal_text = f"Goal: {display_goal}"
+        if self.inject_fault:
+            goal_text += f"   [bold red on white] FAULT: {self.inject_fault} [/]"
         with Vertical(id="goal-bar"):
-            yield Label(f"Goal: {display_goal}", id="goal")
+            yield Label(goal_text, id="goal")
             with Horizontal(id="progress-row"):
                 yield ProgressBar(total=100, show_eta=False, id="progress")
                 yield Label("0/0 tasks", id="task-count")
@@ -457,9 +464,17 @@ class PMAgentTUI(App):
                     "Planner", "running", f"retry {attempt} with error feedback"
                 )
 
+            # Day 11 fault injection: planner-yaml forces every attempt
+            # (including the final one) to return malformed YAML. The retry
+            # loop runs to exhaustion, raises PlannerError, and the existing
+            # except branch falls back to mock_planner_decompose.
+            sim_failures = 3 if self.inject_fault == "planner-yaml" else 0
             try:
                 tasks, planner_cost = await plan(
-                    self.goal or "", self.repo, on_retry=_on_retry
+                    self.goal or "",
+                    self.repo,
+                    on_retry=_on_retry,
+                    simulate_failures=sim_failures,
                 )  # type: ignore[arg-type]
                 self._tasks = tasks
                 self._cost_usd += planner_cost
@@ -534,12 +549,24 @@ class PMAgentTUI(App):
 
             full_prompt = task.prompt + CODER_COMMIT_SUFFIX.format(task_id=task.id)
 
-            async for ev in run_claude_async(
-                full_prompt,
-                cwd=str(wt_path),
-                unrestricted=True,
-                timeout=self.coder_timeout,
-            ):
+            # Day 11 fault injection: substitute a deterministic synthetic
+            # event stream when the demo asks for timeout / api-error. The
+            # downstream event handlers stay unchanged so the recovery UI
+            # is exercised by the real codepath, just driven from a fake
+            # source.
+            if self.inject_fault == "coder-timeout":
+                stream = self._fault_stream_timeout(task.id)
+            elif self.inject_fault == "api-error":
+                stream = self._fault_stream_api_error(task.id)
+            else:
+                stream = run_claude_async(
+                    full_prompt,
+                    cwd=str(wt_path),
+                    unrestricted=True,
+                    timeout=self.coder_timeout,
+                )
+
+            async for ev in stream:
                 self._event_count += 1
                 et, st = ev.get("type"), ev.get("subtype")
                 if et == "system" and st == "init":
@@ -783,6 +810,51 @@ class PMAgentTUI(App):
         path.write_text("\n".join(out))
         return path
 
+    # ---------- fault injection (Day 11) ----------
+    async def _fault_stream_timeout(self, task_id: str):
+        """Synthetic event stream that mimics a Coder subprocess hitting the
+        configured timeout. Runs free, deterministic — used when
+        --inject-fault=coder-timeout is set."""
+        yield {
+            "type": "system",
+            "subtype": "init",
+            "session_id": f"fault-{task_id}",
+        }
+        # Brief pause so the "creating worktree → running → timeout" arc
+        # is legible in the recording.
+        await asyncio.sleep(0.4)
+        yield {
+            "type": "system",
+            "subtype": "timeout",
+            "elapsed_s": int(self.coder_timeout),
+        }
+
+    async def _fault_stream_api_error(self, task_id: str):
+        """Synthetic event stream that yields a rate-limit-rejected event
+        followed by a result(is_error=true). Reproduces the exact API
+        failure path Day 8 added detection for, without spending tokens."""
+        yield {
+            "type": "system",
+            "subtype": "init",
+            "session_id": f"fault-{task_id}",
+        }
+        await asyncio.sleep(0.3)
+        yield {
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "rejected",
+                "resetsAt": "2026-05-09T23:59:59Z",
+            },
+        }
+        await asyncio.sleep(0.3)
+        yield {
+            "type": "result",
+            "is_error": True,
+            "result": "rate limit exceeded — synthetic fault injection",
+            "total_cost_usd": 0.0,
+            "duration_ms": 500,
+        }
+
     # ---------- ui helpers ----------
     @staticmethod
     def _coder_card(task_id: str) -> str:
@@ -988,6 +1060,19 @@ def main() -> None:
         default=180.0,
         help="seconds before each Coder subprocess is killed (default: 180)",
     )
+    ap.add_argument(
+        "--inject-fault",
+        choices=("planner-yaml", "coder-timeout", "api-error"),
+        default=None,
+        help="Day 11 demo: deterministically trigger an error path. "
+             "planner-yaml: every planner attempt fails parse, falling back "
+             "to mock_planner_decompose. "
+             "coder-timeout: every Coder yields a synthetic timeout event "
+             "(real timeout handler runs). "
+             "api-error: every Coder yields a synthetic rate-limit + "
+             "is_error result. "
+             "All three are free / deterministic — no extra claude tokens.",
+    )
     args = ap.parse_args()
 
     goal = " ".join(args.goal).strip() or None
@@ -1003,6 +1088,7 @@ def main() -> None:
         use_real_planner=not args.mock_planner,
         test_cmd=args.test_cmd,
         coder_timeout=args.coder_timeout,
+        inject_fault=args.inject_fault,
     ).run()
 
 
