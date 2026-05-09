@@ -26,8 +26,16 @@ class RunResult:
     exit_code: int
 
 
-def run_claude(prompt: str, role: str | None = None) -> RunResult:
+def run_claude(
+    prompt: str, role: str | None = None, isolate: bool = True
+) -> RunResult:
     cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose"]
+    if isolate:
+        # Skip user-level settings (~/.claude/settings.json). This drops the
+        # parent session's hooks (laziness-self-report, teamagent SessionStart,
+        # etc) without affecting auth (keychain still works) or model defaults.
+        # Side benefit: ~70% cost & latency reduction per call vs full settings.
+        cmd += ["--setting-sources", "project,local"]
     if role:
         cmd += ["--append-system-prompt", role]
 

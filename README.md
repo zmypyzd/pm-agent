@@ -24,10 +24,16 @@ uv run python -m pm_agent.runner "review this code" --role "You are a senior cod
 
 ## Day 1 known issues / mitigations
 
-- **[CONFIRMED]** Baseline cost per `claude -p` invocation: ~$0.17 (40k token system prompt overhead).
-  Mitigation: use `--append-system-prompt` per role; for production demo consider Anthropic SDK direct (skips Claude Code session loader).
-- **[CONFIRMED, OPEN]** Hook inheritance: spawned `claude -p` inherits all `~/.claude/settings.json` hooks.
-  Verified: parent session's `laziness-self-report` stop-hook injected into child's output, **replaced the real answer**.
-  Mitigation TBD: clean HOME or `--no-settings` flag for child processes.
+- **[FIXED 2026-05-09]** Hook inheritance + cost (single fix solved both).
+  Was: spawned `claude -p` inherited `~/.claude/settings.json` hooks (laziness-self-report
+  Stop hook, teamagent SessionStart hook), and loaded the full ~40k token user-level
+  system prompt. The laziness Stop hook **replaced the child's real answer** with a
+  forced self-report re-emission. Cost was ~$0.17/call.
+  Fix: pass `--setting-sources project,local` when spawning. This skips user-level
+  settings (where the hooks live) but keeps keychain auth and model defaults.
+  After fix: clean output, `$0.056`/call (-68%), 2.7s/call (-71%).
+  Implemented in `runner.py` as `isolate=True` (default).
+  Alternative (not used): `--bare` — even more aggressive, but requires `ANTHROPIC_API_KEY`
+  env var because it bypasses keychain.
 - **[FIXED 2026-05-09]** `~/.teamagent/hooks/bin-session-start.cjs` no longer errors.
   Was: `Cannot find module 'web-tree-sitter'`. Fix applied: `cd ~/.teamagent && npm i web-tree-sitter`.
