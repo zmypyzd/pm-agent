@@ -63,14 +63,16 @@ async def run_claude_async(
     isolate: bool = True,
     cwd: str | None = None,
     unrestricted: bool = False,
+    timeout: float | None = None,
 ) -> AsyncIterator[dict]:
     """Spawn claude -p and yield each parsed stream-json event as a dict.
 
-    `cwd` selects the working directory for the subprocess — the orchestrator
-    points each Coder at its own git worktree so concurrent edits don't
-    collide. `unrestricted=True` enables tool calls without permission
-    prompts (required for Coders that actually edit files; the Planner
-    leaves it off because it should only emit text).
+    `cwd` selects the working directory for the subprocess. `unrestricted=True`
+    enables tool calls without permission prompts. `timeout` (seconds) caps
+    total wall-clock; on expiry we SIGTERM the process, wait briefly, SIGKILL
+    if still alive, and yield a synthetic
+    {"type":"system","subtype":"timeout","elapsed_s": <t>} event before
+    returning. The caller can treat that as task failure.
 
     Caller drives consumption rate. Errors during parse are swallowed so
     a malformed line doesn't kill the stream.
@@ -83,18 +85,54 @@ async def run_claude_async(
         cwd=cwd,
     )
     assert proc.stdout is not None
-    while True:
-        raw = await proc.stdout.readline()
-        if not raw:
-            break
-        line = raw.decode("utf-8", errors="replace").strip()
-        if not line:
-            continue
-        try:
-            yield json.loads(line)
-        except json.JSONDecodeError:
-            continue
-    await proc.wait()
+
+    loop = asyncio.get_event_loop()
+    deadline = None if timeout is None else loop.time() + timeout
+    timed_out = False
+
+    try:
+        while True:
+            if deadline is not None:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    raw = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=remaining
+                    )
+                except asyncio.TimeoutError:
+                    timed_out = True
+                    break
+            else:
+                raw = await proc.stdout.readline()
+            if not raw:
+                break
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    finally:
+        if timed_out and proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        elif proc.returncode is None:
+            await proc.wait()
+
+    if timed_out:
+        yield {
+            "type": "system",
+            "subtype": "timeout",
+            "elapsed_s": timeout,
+            "exit_code": proc.returncode,
+        }
 
 
 def run_claude(

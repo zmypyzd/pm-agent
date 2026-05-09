@@ -178,6 +178,7 @@ class PMAgentTUI(App):
         single: bool = False,
         use_real_planner: bool = True,
         test_cmd: str | None = None,
+        coder_timeout: float = 180.0,
     ) -> None:
         super().__init__()
         self.goal = goal
@@ -185,6 +186,7 @@ class PMAgentTUI(App):
         self.single = single
         self.use_real_planner = use_real_planner
         self.test_cmd = test_cmd
+        self.coder_timeout = coder_timeout
         self.repo = repo
         self.wm: WorktreeManager | None = None
         if not self.is_mock and repo is not None:
@@ -468,7 +470,10 @@ class PMAgentTUI(App):
             full_prompt = task.prompt + CODER_COMMIT_SUFFIX.format(task_id=task.id)
 
             async for ev in run_claude_async(
-                full_prompt, cwd=str(wt_path), unrestricted=True
+                full_prompt,
+                cwd=str(wt_path),
+                unrestricted=True,
+                timeout=self.coder_timeout,
             ):
                 self._event_count += 1
                 et, st = ev.get("type"), ev.get("subtype")
@@ -494,6 +499,16 @@ class PMAgentTUI(App):
                     self._set_agent_status(coder_card, "done", f"{task.id}: complete")
                     progress.update(
                         progress=int(100 * self._tasks_done / max(1, len(self._tasks)))
+                    )
+                elif et == "system" and ev.get("subtype") == "timeout":
+                    elapsed_s = ev.get("elapsed_s")
+                    log.write(
+                        f"[red][{task.id}] ✗ TIMEOUT after {elapsed_s}s — "
+                        f"subprocess killed[/]"
+                    )
+                    self._update_task_status(task.id, "timeout")
+                    self._set_agent_status(
+                        coder_card, "failed", f"{task.id}: timeout"
                     )
 
                 elapsed = time.time() - self._start_time
@@ -735,6 +750,12 @@ def main() -> None:
         help="shell command to run inside the integration worktree after a clean merge "
              "(e.g. 'pytest tests/' or 'python3 -m unittest discover')",
     )
+    ap.add_argument(
+        "--coder-timeout",
+        type=float,
+        default=180.0,
+        help="seconds before each Coder subprocess is killed (default: 180)",
+    )
     args = ap.parse_args()
 
     goal = " ".join(args.goal).strip() or None
@@ -749,6 +770,7 @@ def main() -> None:
         single=args.single,
         use_real_planner=not args.mock_planner,
         test_cmd=args.test_cmd,
+        coder_timeout=args.coder_timeout,
     ).run()
 
 
