@@ -40,11 +40,16 @@ Output rules — non-negotiable:
 - Do NOT call any tools. Do NOT read files. Use only the context provided.
 
 YAML string rules (critical — your output is parsed by yaml.safe_load):
-- Do NOT use backticks (`) anywhere inside string values. Backticks are
-  illegal as the first non-whitespace character of a YAML scalar and will
-  break the parser.
-- Do NOT use markdown formatting (no **, no _, no [], no `). Plain prose only.
-- If a string contains a colon, quote it with single quotes.
+- Do NOT use backticks (`) anywhere inside string values.
+- Do NOT use curly braces { } inside string values. YAML reads them as
+  inline mappings. Describe in plain English instead. Write
+  "a dict with key status equal to ok" not '{"status": "ok"}'.
+- Do NOT use square brackets [ ] inside string values. YAML reads them as
+  inline lists.
+- Do NOT use JSON literal values inside acceptance criteria. Describe
+  shapes in plain English.
+- Do NOT use markdown formatting (no **, no _, no `).
+- If a string contains a colon, single-quote the entire string.
 - For multi-line strings (like the prompt field) use the | block style.
 
 Decomposition rules:

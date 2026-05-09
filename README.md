@@ -34,6 +34,19 @@ uv run python -m pm_agent.tui "Add JSONL logger for each claude call"
 
 # Skip the real Planner for cheap iteration:
 uv run python -m pm_agent.tui "demo" --mock-planner
+
+# Day-7 end-to-end demo: prepares a target repo and runs full Planner -> 2 Coders -> diff
+mkdir -p /tmp/pm-agent-day7-target && cd /tmp/pm-agent-day7-target
+git init -q && echo init > README.md && git add . && git commit -q -m init
+# (or copy the seed server.py + tests/test_server.py used in the day-7 verification)
+cd -
+uv run python -m pm_agent.tui --repo /tmp/pm-agent-day7-target "Add /health endpoint to handle_request returning {status: ok} as a dict, plus a test"
+
+# After the run completes:
+ls ~/.pm-agent/runs/                         # one dir per run
+cat ~/.pm-agent/runs/<latest>/summary.md     # PR-style report with diffs
+git -C /tmp/pm-agent-day7-target apply ~/.pm-agent/runs/<latest>/T-1.diff
+git -C /tmp/pm-agent-day7-target apply ~/.pm-agent/runs/<latest>/T-2.diff
 ```
 
 Snapshots:
@@ -41,13 +54,14 @@ Snapshots:
 - `docs/tui-day3-real-snapshot.svg` — single-coder, 4 events, $0.057
 - `docs/tui-day5-multi-snapshot.svg` — 2 parallel coders (mock plan), 8 events, $0.112
 - `docs/tui-day6-planner-snapshot.svg` — real Planner emits 2 file-disjoint YAML tasks
+- `docs/tui-day7-e2e-snapshot.svg` — full run: real Planner + 2 unrestricted Coders editing real code, diffs captured to artifacts dir
 
 Architecture:
 - `pm_agent/tasks.py` — shared `CoderTask` schema (id / title / prompt / allowed_paths / acceptance)
-- `pm_agent/runner.py` — `run_claude_async(prompt, role, isolate, cwd)` async event stream
-- `pm_agent/worktree.py` — `WorktreeManager.{create,cleanup,acreate,acleanup}` for isolated parallel work
-- `pm_agent/planner.py` — `plan(goal, repo)` calls claude with strict YAML system prompt; parser tolerates fenced/naked YAML and strips backticks defensively
-- `pm_agent/tui.py` — Textual app, Planner runs first (with mock fallback on PlannerError), then `asyncio.gather` over `_stream_one(task)` per Coder
+- `pm_agent/runner.py` — `run_claude_async(prompt, role, isolate, cwd, unrestricted)` async event stream; `unrestricted=True` adds `--dangerously-skip-permissions` for Coders that need to Edit/Write/Bash
+- `pm_agent/worktree.py` — `WorktreeManager.{create,cleanup,acreate,acleanup,diff_against_base}`; auto-detects base branch (master/main)
+- `pm_agent/planner.py` — `plan(goal, repo)` calls claude with strict YAML system prompt; parser tolerates fenced/naked YAML, strips backticks defensively, rejects `{}`/`[]` literals via prompt rule
+- `pm_agent/tui.py` — Textual app. Planner runs first (with mock fallback on PlannerError); `asyncio.gather` over `_stream_one(task)` per Coder; each Coder commits in its worktree, diff is captured before cleanup; final `summary.md` written to `~/.pm-agent/runs/<run-id>/`
 
 ## Day 1 known issues / mitigations
 

@@ -36,13 +36,22 @@ class RunResult:
     exit_code: int
 
 
-def _build_cmd(prompt: str, role: str | None, isolate: bool) -> list[str]:
+def _build_cmd(
+    prompt: str, role: str | None, isolate: bool, unrestricted: bool
+) -> list[str]:
     cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose"]
     if isolate:
         # Skip user-level settings (~/.claude/settings.json). Drops parent's
         # global hooks; keeps keychain auth and model defaults. ~70% cost &
         # latency reduction per call vs default loader.
         cmd += ["--setting-sources", "project,local"]
+    if unrestricted:
+        # Required for Coder agents: `claude -p` defaults to deny-all on
+        # tool calls. Without this flag a Coder cannot Edit/Write/Bash
+        # inside its sandboxed worktree. Safe in our model because each
+        # Coder runs with cwd pinned to a fresh git worktree on its own
+        # branch — blast radius is the worktree, not the host.
+        cmd += ["--dangerously-skip-permissions"]
     if role:
         cmd += ["--append-system-prompt", role]
     return cmd
@@ -53,15 +62,20 @@ async def run_claude_async(
     role: str | None = None,
     isolate: bool = True,
     cwd: str | None = None,
+    unrestricted: bool = False,
 ) -> AsyncIterator[dict]:
     """Spawn claude -p and yield each parsed stream-json event as a dict.
 
     `cwd` selects the working directory for the subprocess — the orchestrator
     points each Coder at its own git worktree so concurrent edits don't
-    collide. Caller drives consumption rate. Errors during parse are
-    swallowed so a malformed line doesn't kill the stream.
+    collide. `unrestricted=True` enables tool calls without permission
+    prompts (required for Coders that actually edit files; the Planner
+    leaves it off because it should only emit text).
+
+    Caller drives consumption rate. Errors during parse are swallowed so
+    a malformed line doesn't kill the stream.
     """
-    cmd = _build_cmd(prompt, role, isolate)
+    cmd = _build_cmd(prompt, role, isolate, unrestricted)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -84,10 +98,13 @@ async def run_claude_async(
 
 
 def run_claude(
-    prompt: str, role: str | None = None, isolate: bool = True
+    prompt: str,
+    role: str | None = None,
+    isolate: bool = True,
+    unrestricted: bool = False,
 ) -> RunResult:
     """Sync runner. Streams events to stdout/stderr and returns a summary."""
-    cmd = _build_cmd(prompt, role, isolate)
+    cmd = _build_cmd(prompt, role, isolate, unrestricted)
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
     )

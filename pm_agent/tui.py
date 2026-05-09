@@ -74,6 +74,21 @@ MOCK_LOG_LINES = [
 ]
 
 
+CODER_COMMIT_SUFFIX = """
+
+When you finish making your code changes:
+1. Stage your changes:  git add -A
+2. Commit them:          git commit -m "{task_id}: <one-line summary>"
+3. Print exactly: DONE
+
+If you made no file changes, instead print: NO_CHANGES
+Stay strictly inside this worktree directory. Do not push, do not switch branches.
+"""
+
+
+ARTIFACTS_ROOT = Path.home() / ".pm-agent" / "runs"
+
+
 def mock_planner_decompose(goal: str) -> list[CoderTask]:
     """Cheap fallback when --mock-planner is set or the real planner errors.
     Returns 2 trivially parallelizable subtasks."""
@@ -154,6 +169,7 @@ class PMAgentTUI(App):
     _cost_usd: float = 0.0
     _tasks_done: int = 0
     _streamed_text: str = ""
+    _session_complete: bool = False
 
     def __init__(
         self,
@@ -172,6 +188,9 @@ class PMAgentTUI(App):
         if not self.is_mock and repo is not None:
             self.wm = WorktreeManager(repo)
         self._tasks: list[CoderTask] = []
+        self._run_id: str = time.strftime("%Y%m%d-%H%M%S")
+        self._artifacts_dir: Path = ARTIFACTS_ROOT / self._run_id
+        self._task_diffs: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
         display_goal = self.goal if self.goal else GOAL_MOCK
@@ -287,6 +306,10 @@ class PMAgentTUI(App):
             f"in {time.time() - self._start_time:.1f}s"
         )
 
+        summary_path = self._write_run_summary()
+        log.write(f"[bold green]→ run summary:[/] {summary_path}")
+        self._session_complete = True
+
     async def _run_planner(self, log: RichLog, table: DataTable) -> None:
         """Decompose self.goal into self._tasks. Falls back to mock on error."""
         used_mock = False
@@ -304,12 +327,25 @@ class PMAgentTUI(App):
                     f"cost ${planner_cost:.4f}[/]"
                 )
             except PlannerError as e:
+                self._artifacts_dir.mkdir(parents=True, exist_ok=True)
+                (self._artifacts_dir / "planner-error.log").write_text(str(e))
                 log.write(f"[red][Planner] failed:[/] {e}")
                 log.write("[yellow][Planner] falling back to mock decomposer[/]")
                 self._tasks = mock_planner_decompose(self.goal or "")
                 used_mock = True
             except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                # Persist the traceback so smoke tests / users can diagnose.
+                self._artifacts_dir.mkdir(parents=True, exist_ok=True)
+                (self._artifacts_dir / "planner-crash.log").write_text(
+                    f"{type(e).__name__}: {e}\n\n{tb}"
+                )
                 log.write(f"[red][Planner] crashed:[/] {type(e).__name__}: {e}")
+                log.write(
+                    f"[red][Planner] traceback saved to[/] "
+                    f"{self._artifacts_dir / 'planner-crash.log'}"
+                )
                 log.write("[yellow][Planner] falling back to mock decomposer[/]")
                 self._tasks = mock_planner_decompose(self.goal or "")
                 used_mock = True
@@ -356,7 +392,11 @@ class PMAgentTUI(App):
             self._set_agent_status(coder_card, "running", f"{task.id}: streaming")
             self._update_task_status(task.id, "running")
 
-            async for ev in run_claude_async(task.prompt, cwd=str(wt_path)):
+            full_prompt = task.prompt + CODER_COMMIT_SUFFIX.format(task_id=task.id)
+
+            async for ev in run_claude_async(
+                full_prompt, cwd=str(wt_path), unrestricted=True
+            ):
                 self._event_count += 1
                 et, st = ev.get("type"), ev.get("subtype")
                 if et == "system" and st == "init":
@@ -389,11 +429,76 @@ class PMAgentTUI(App):
                         self._cost_usd, self._event_count, elapsed, "events"
                     )
                 )
+
+            # Capture diff BEFORE cleanup wipes the branch.
+            diff = await asyncio.to_thread(self.wm.diff_against_base, task.id)
+            self._task_diffs[task.id] = diff
+            self._save_diff_artifact(task.id, diff)
+            stats = self._diff_stats(diff)
+            log.write(
+                f"[bold magenta][{task.id}] diff:[/] "
+                f"+{stats['added']} -{stats['removed']} in {stats['files']} file(s)"
+            )
         finally:
             await self.wm.acleanup(task.id)
             log.write(f"[dim][{task.id}] worktree cleaned[/]")
 
-    # ---------- helpers ----------
+    # ---------- artifacts ----------
+    def _save_diff_artifact(self, task_id: str, diff: str) -> None:
+        self._artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (self._artifacts_dir / f"{task_id}.diff").write_text(diff)
+
+    @staticmethod
+    def _diff_stats(diff: str) -> dict[str, int]:
+        added = 0
+        removed = 0
+        files: set[str] = set()
+        for line in diff.splitlines():
+            if line.startswith("+++") or line.startswith("---"):
+                # +++ b/path  /  --- a/path  -> file marker, count later
+                if len(line) > 6:
+                    files.add(line[6:])
+                continue
+            if line.startswith("+"):
+                added += 1
+            elif line.startswith("-"):
+                removed += 1
+        files.discard("ev/null")  # /dev/null appears for new files
+        return {"added": added, "removed": removed, "files": len(files)}
+
+    def _write_run_summary(self) -> Path:
+        self._artifacts_dir.mkdir(parents=True, exist_ok=True)
+        out = [
+            f"# pm-agent run {self._run_id}",
+            "",
+            f"- **goal**: {self.goal}",
+            f"- **target repo**: {self.repo}",
+            f"- **total cost**: ${self._cost_usd:.4f}",
+            f"- **duration**: {time.time() - self._start_time:.1f}s",
+            f"- **tasks completed**: {self._tasks_done}/{len(self._tasks)}",
+            "",
+        ]
+        for t in self._tasks:
+            diff = self._task_diffs.get(t.id, "")
+            stats = self._diff_stats(diff) if diff else {"added": 0, "removed": 0, "files": 0}
+            out += [
+                f"## {t.id}: {t.title}",
+                "",
+                f"- **branch**: ai/{t.id}",
+                f"- **diff**: +{stats['added']} -{stats['removed']} lines, {stats['files']} file(s)",
+                f"- **allowed_paths**: {', '.join(t.allowed_paths) or '(none)'}",
+                "",
+                "**acceptance criteria:**",
+                "",
+            ]
+            for c in t.acceptance:
+                out.append(f"- {c}")
+            out += ["", "<details><summary>diff</summary>", "", "```diff", diff[:8000], "```", "", "</details>", ""]
+        path = self._artifacts_dir / "summary.md"
+        path.write_text("\n".join(out))
+        return path
+
+    # ---------- ui helpers ----------
     @staticmethod
     def _coder_card(task_id: str) -> str:
         # T-1 -> Coder-1, T-2 -> Coder-2 (matching ID convention)

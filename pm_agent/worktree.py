@@ -34,6 +34,32 @@ class WorktreeManager:
         if not (self.repo_root / ".git").exists():
             raise WorktreeError(f"{self.repo_root} is not a git repo")
         self.worktrees_dir = self.repo_root / WORKTREES_DIRNAME
+        self.base_branch = self._detect_base_branch()
+
+    def _detect_base_branch(self) -> str:
+        try:
+            out = _run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"], self.repo_root
+            ).stdout.strip()
+            return out or "main"
+        except subprocess.CalledProcessError:
+            return "main"
+
+    def diff_against_base(self, task_id: str) -> str:
+        """Return `git diff <base>..<task_branch>` as a unified diff string.
+        Empty string when the branch has no diverging commits."""
+        try:
+            return _run(
+                [
+                    "git",
+                    "diff",
+                    f"{self.base_branch}..{self._branch_for(task_id)}",
+                ],
+                self.repo_root,
+                check=False,
+            ).stdout
+        except subprocess.CalledProcessError:
+            return ""
 
     def _path_for(self, task_id: str) -> Path:
         return self.worktrees_dir / task_id
