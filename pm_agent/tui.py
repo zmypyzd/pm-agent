@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -49,6 +50,28 @@ from pm_agent.tasks import CoderTask
 from pm_agent.worktree import IntegrationResult, WorktreeManager
 
 GOAL_MOCK = "Add room invite link API to werewolf platform (mock)"
+
+# Day 10 polish: status icons + colors used by agent cards and task table.
+STATUS_ICONS = {
+    "running": "▶",
+    "done":    "✓",
+    "failed":  "✗",
+    "idle":    "⏸",
+    "blocked": "⏸",
+    "ready":   "·",
+    "timeout": "✗",
+    "api_error": "✗",
+}
+STATUS_COLORS = {
+    "running":   "yellow",
+    "done":      "green",
+    "failed":    "red",
+    "idle":      "grey50",
+    "blocked":   "red",
+    "ready":     "grey50",
+    "timeout":   "orange1",
+    "api_error": "red",
+}
 
 AGENTS_INITIAL = [
     ("Planner",  "done",     "Decomposed into 3 tasks"),
@@ -123,6 +146,13 @@ class PMAgentTUI(App):
         border: solid $primary;
     }
     #goal-bar Label { text-style: bold; }
+    #progress-row { height: 1; }
+    #progress { width: 1fr; }
+    #task-count {
+        width: auto;
+        padding: 0 1;
+        color: $text;
+    }
 
     #main { height: 1fr; }
 
@@ -161,7 +191,10 @@ class PMAgentTUI(App):
     }
     """
 
-    BINDINGS = [("q", "quit", "Quit")]
+    BINDINGS = [
+        ("q", "quit", "Quit"),
+        ("r", "rerun", "Re-run"),
+    ]
 
     _start_time: float = 0.0
     _tick_counter: int = 0
@@ -203,7 +236,9 @@ class PMAgentTUI(App):
         display_goal = self.goal if self.goal else GOAL_MOCK
         with Vertical(id="goal-bar"):
             yield Label(f"Goal: {display_goal}", id="goal")
-            yield ProgressBar(total=100, show_eta=False, id="progress")
+            with Horizontal(id="progress-row"):
+                yield ProgressBar(total=100, show_eta=False, id="progress")
+                yield Label("0/0 tasks", id="task-count")
         with Horizontal(id="main"):
             with Vertical(id="left"):
                 yield Static("Tasks", classes="panel-title")
@@ -212,7 +247,7 @@ class PMAgentTUI(App):
                 yield Static("Active Agents", classes="panel-title")
                 for name, status, action in AGENTS_INITIAL:
                     yield Static(
-                        f"[bold]{name}[/]\n[dim]{action}[/]",
+                        self._agent_card_text(name, status, action),
                         id=f"agent-{name}",
                         classes=f"agent-card status-{status}",
                     )
@@ -229,19 +264,20 @@ class PMAgentTUI(App):
             "ID", "Task", "Status"
         )
         self._task_rows: dict[str, object] = {}
-        log = self.query_one("#logs", RichLog)
 
         if self.is_mock:
             for tid, title, status in TASKS_MOCK:
-                table.add_row(tid, title, status)
-            log.write("[green]pm-agent TUI started (mock mode)[/]")
-            log.write(f"[dim]goal:[/] {GOAL_MOCK}")
+                rk = table.add_row(tid, title, self._status_cell(status))
+                self._task_rows[tid] = rk
+            self._update_task_count()
+            self._log("[green]pm-agent TUI started (mock mode)[/]")
+            self._log(f"[dim]goal:[/] {GOAL_MOCK}")
             self.set_interval(0.8, self._tick)
             return
 
-        log.write("[green]pm-agent TUI started (real mode)[/]")
-        log.write(f"[dim]goal:[/] {self.goal}")
-        log.write(f"[dim]target repo:[/] {self.repo}")
+        self._log("[green]pm-agent TUI started (real mode)[/]")
+        self._log(f"[dim]goal:[/] {self.goal}")
+        self._log(f"[dim]target repo:[/] {self.repo}")
 
         # Note: tasks are populated AFTER planner runs (or right now if --single).
         if self.single:
@@ -255,20 +291,35 @@ class PMAgentTUI(App):
                 )
             ]
             for t in self._tasks:
-                rk = table.add_row(t.id, t.title[:30], "ready")
+                rk = table.add_row(t.id, t.title[:30], self._status_cell("ready"))
                 self._task_rows[t.id] = rk
 
+        self._update_task_count()
         self._run_session()
 
     # ---------- mock mode ----------
     def _tick(self) -> None:
-        log = self.query_one("#logs", RichLog)
         progress = self.query_one("#progress", ProgressBar)
         footer = self.query_one("#footer-bar", Static)
 
-        log.write(MOCK_LOG_LINES[self._tick_counter % len(MOCK_LOG_LINES)])
+        self._log(MOCK_LOG_LINES[self._tick_counter % len(MOCK_LOG_LINES)])
         self._tick_counter += 1
-        progress.update(progress=min(100, self._tick_counter * 4))
+        pct = min(100, self._tick_counter * 4)
+        progress.update(progress=pct)
+
+        # Fake task progression for mock visual: 3 tasks finishing across ticks.
+        new_done = min(len(TASKS_MOCK), self._tick_counter // 8)
+        if new_done != self._tasks_done:
+            self._tasks_done = new_done
+            table = self.query_one("#tasks", DataTable)
+            for i, (tid, _title, _status) in enumerate(TASKS_MOCK):
+                rk = self._task_rows.get(tid)
+                if rk is None:
+                    continue
+                new_status = "done" if i < new_done else "running"
+                table.update_cell(rk, self._col_status, self._status_cell(new_status))
+        self._update_task_count()
+
         elapsed = time.time() - self._start_time
         cost = 0.012 * self._tick_counter
         tokens = 320 * self._tick_counter
@@ -277,15 +328,15 @@ class PMAgentTUI(App):
     # ---------- real mode ----------
     @work(exclusive=True)
     async def _run_session(self) -> None:
-        log = self.query_one("#logs", RichLog)
         table = self.query_one("#tasks", DataTable)
         try:
             # Step 1: Planner (skipped in --single mode where tasks are pre-set)
             if not self.single:
-                await self._run_planner(log, table)
+                await self._run_planner(table)
+                self._update_task_count()
 
             if not self._tasks:
-                log.write("[red]no tasks to run; aborting session[/]")
+                self._log("[red]no tasks to run; aborting session[/]")
                 return
 
             # Idle any coder card we won't use this run
@@ -301,13 +352,13 @@ class PMAgentTUI(App):
 
             for t, r in zip(self._tasks, results):
                 if isinstance(r, Exception):
-                    log.write(f"[red][{t.id}] failed: {r}[/]")
+                    self._log(f"[red][{t.id}] failed: {r}[/]")
                     self._update_task_status(t.id, "failed")
                     self._set_agent_status(
                         self._coder_card(t.id), "failed", f"{t.id} crashed"
                     )
 
-            log.write(
+            self._log(
                 f"[bold green]✓ all coders finished[/] "
                 f"total cost ${self._cost_usd:.4f} "
                 f"in {time.time() - self._start_time:.1f}s"
@@ -315,18 +366,18 @@ class PMAgentTUI(App):
 
             # Step 3: integration (skip --single mode; nothing to merge)
             if not self.single and self.wm and self._tasks:
-                await self._run_integration(log)
+                await self._run_integration()
 
             summary_path = self._write_run_summary()
-            log.write(f"[bold green]→ run summary:[/] {summary_path}")
+            self._log(f"[bold green]→ run summary:[/] {summary_path}")
         finally:
             # Cleanup task branches + integration branch even if cancelled.
             await self._cleanup_branches()
             self._session_complete = True
 
-    async def _run_integration(self, log: RichLog) -> None:
+    async def _run_integration(self) -> None:
         assert self.wm is not None
-        log.write(
+        self._log(
             f"[bold cyan][Integrator][/] merging "
             f"{', '.join(t.id for t in self._tasks)} into "
             f"ai/integration/{self._run_id}"
@@ -336,23 +387,23 @@ class PMAgentTUI(App):
                 self._run_id, [t.id for t in self._tasks], test_cmd=self.test_cmd
             )
         except Exception as e:
-            log.write(f"[red][Integrator] crashed:[/] {type(e).__name__}: {e}")
+            self._log(f"[red][Integrator] crashed:[/] {type(e).__name__}: {e}")
             return
 
         ig = self._integration
         if ig.conflicts:
-            log.write(
+            self._log(
                 f"[red][Integrator] {len(ig.conflicts)} conflict(s):[/] "
                 + ", ".join(c["task_id"] for c in ig.conflicts)
             )
             for c in ig.conflicts:
-                log.write(f"[red]  {c['task_id']}: {c['output'].splitlines()[0][:100]}[/]")
+                self._log(f"[red]  {c['task_id']}: {c['output'].splitlines()[0][:100]}[/]")
         else:
-            log.write(
+            self._log(
                 f"[green][Integrator] ✓ merged {len(ig.merged_tasks)} branch(es) clean[/]"
             )
             stats = self._diff_stats(ig.diff_against_base)
-            log.write(
+            self._log(
                 f"[dim][Integrator] integrated diff: "
                 f"+{stats['added']} -{stats['removed']} in {stats['files']} file(s)[/]"
             )
@@ -361,7 +412,7 @@ class PMAgentTUI(App):
             tr = ig.test_result
             ok = tr["exit_code"] == 0
             colour = "green" if ok else "red"
-            log.write(
+            self._log(
                 f"[bold {colour}][Integrator] tests "
                 f"{'PASS' if ok else 'FAIL'}[/] "
                 f"({tr['command']!r} → exit {tr['exit_code']})"
@@ -387,21 +438,21 @@ class PMAgentTUI(App):
             except Exception:
                 pass
 
-    async def _run_planner(self, log: RichLog, table: DataTable) -> None:
+    async def _run_planner(self, table: DataTable) -> None:
         """Decompose self.goal into self._tasks. Falls back to mock on error."""
         used_mock = False
         if self.use_real_planner:
             self._set_agent_status(
                 "Planner", "running", "calling claude with YAML system prompt"
             )
-            log.write("[bold cyan][Planner][/] decomposing goal...")
+            self._log("[bold cyan][Planner][/] decomposing goal...")
 
             def _on_retry(attempt: int, error: str) -> None:
-                log.write(
+                self._log(
                     f"[yellow][Planner] retry {attempt}: previous output "
                     f"failed parse[/]"
                 )
-                log.write(f"[dim][Planner]   error: {error[:120]}[/]")
+                self._log(f"[dim][Planner]   error: {error[:120]}[/]")
                 self._set_agent_status(
                     "Planner", "running", f"retry {attempt} with error feedback"
                 )
@@ -412,15 +463,15 @@ class PMAgentTUI(App):
                 )  # type: ignore[arg-type]
                 self._tasks = tasks
                 self._cost_usd += planner_cost
-                log.write(
+                self._log(
                     f"[green][Planner] ✓ {len(tasks)} tasks, "
                     f"cost ${planner_cost:.4f}[/]"
                 )
             except PlannerError as e:
                 self._artifacts_dir.mkdir(parents=True, exist_ok=True)
                 (self._artifacts_dir / "planner-error.log").write_text(str(e))
-                log.write(f"[red][Planner] failed:[/] {e}")
-                log.write("[yellow][Planner] falling back to mock decomposer[/]")
+                self._log(f"[red][Planner] failed:[/] {e}")
+                self._log("[yellow][Planner] falling back to mock decomposer[/]")
                 self._tasks = mock_planner_decompose(self.goal or "")
                 used_mock = True
             except Exception as e:
@@ -431,31 +482,31 @@ class PMAgentTUI(App):
                 (self._artifacts_dir / "planner-crash.log").write_text(
                     f"{type(e).__name__}: {e}\n\n{tb}"
                 )
-                log.write(f"[red][Planner] crashed:[/] {type(e).__name__}: {e}")
-                log.write(
+                self._log(f"[red][Planner] crashed:[/] {type(e).__name__}: {e}")
+                self._log(
                     f"[red][Planner] traceback saved to[/] "
                     f"{self._artifacts_dir / 'planner-crash.log'}"
                 )
-                log.write("[yellow][Planner] falling back to mock decomposer[/]")
+                self._log("[yellow][Planner] falling back to mock decomposer[/]")
                 self._tasks = mock_planner_decompose(self.goal or "")
                 used_mock = True
         else:
-            log.write("[cyan][Planner mock][/] --mock-planner set, skipping real call")
+            self._log("[cyan][Planner mock][/] --mock-planner set, skipping real call")
             self._tasks = mock_planner_decompose(self.goal or "")
             used_mock = True
 
         # Update task table now that we have real tasks
         for t in self._tasks:
-            rk = table.add_row(t.id, t.title[:30], "ready")
+            rk = table.add_row(t.id, t.title[:30], self._status_cell("ready"))
             self._task_rows[t.id] = rk
 
         # Surface acceptance + paths in the log so user can verify the plan
         for t in self._tasks:
-            log.write(
+            self._log(
                 f"[dim]  {t.id} paths:[/] {', '.join(t.allowed_paths) or '(none)'}"
             )
             for crit in t.acceptance[:3]:
-                log.write(f"[dim]  {t.id} accept:[/] {crit}")
+                self._log(f"[dim]  {t.id} accept:[/] {crit}")
 
         label = "mock" if used_mock else "real claude"
         self._set_agent_status(
@@ -464,7 +515,6 @@ class PMAgentTUI(App):
 
     async def _stream_one(self, task: CoderTask) -> None:
         assert self.wm is not None
-        log = self.query_one("#logs", RichLog)
         progress = self.query_one("#progress", ProgressBar)
         footer = self.query_one("#footer-bar", Static)
         coder_card = self._coder_card(task.id)
@@ -473,12 +523,12 @@ class PMAgentTUI(App):
         try:
             wt_path = await self.wm.acreate(task.id)
         except Exception as e:
-            log.write(f"[red][{task.id}] worktree failed: {e}[/]")
+            self._log(f"[red][{task.id}] worktree failed: {e}[/]")
             self._set_agent_status(coder_card, "failed", f"{task.id} worktree error")
             raise
 
         try:
-            log.write(f"[cyan][{task.id}] worktree {wt_path.name} ready[/]")
+            self._log(f"[cyan][{task.id}] worktree {wt_path.name} ready[/]")
             self._set_agent_status(coder_card, "running", f"{task.id}: streaming")
             self._update_task_status(task.id, "running")
 
@@ -494,13 +544,13 @@ class PMAgentTUI(App):
                 et, st = ev.get("type"), ev.get("subtype")
                 if et == "system" and st == "init":
                     sid = (ev.get("session_id") or "")[:8]
-                    log.write(f"[dim][{task.id}] session={sid}[/]")
+                    self._log(f"[dim][{task.id}] session={sid}[/]")
                 elif et == "assistant":
                     for part in ev.get("message", {}).get("content", []):
                         if part.get("type") == "text":
                             text = part["text"]
                             self._streamed_text += text
-                            log.write(f"[bold cyan][{task.id}][/] {text}")
+                            self._log(f"[bold cyan][{task.id}][/] {text}")
                 elif et == "result":
                     cost = ev.get("total_cost_usd") or 0.0
                     dur = ev.get("duration_ms") or 0
@@ -515,11 +565,11 @@ class PMAgentTUI(App):
                             or "unknown api error"
                         )
                         self._task_errors[task.id] = str(reason)[:300]
-                        log.write(
+                        self._log(
                             f"[red][{task.id}] ✗ API ERROR[/] "
                             f"reason={str(reason)[:120]}"
                         )
-                        log.write(
+                        self._log(
                             f"[dim][{task.id}] cost=${float(cost):.4f} dur={dur}ms[/]"
                         )
                         self._update_task_status(task.id, "api_error")
@@ -527,7 +577,7 @@ class PMAgentTUI(App):
                             coder_card, "failed", f"{task.id}: API error"
                         )
                     else:
-                        log.write(
+                        self._log(
                             f"[green][{task.id}] ✓ result[/] "
                             f"cost=${float(cost):.4f} dur={dur}ms"
                         )
@@ -546,13 +596,13 @@ class PMAgentTUI(App):
                     self._rate_limit_events.append(info)
                     status = info.get("status")
                     if status and status != "allowed":
-                        log.write(
+                        self._log(
                             f"[yellow][{task.id}] ⚠ rate-limit {status} "
                             f"(reset @ {info.get('resetsAt')})[/]"
                         )
                 elif et == "system" and ev.get("subtype") == "timeout":
                     elapsed_s = ev.get("elapsed_s")
-                    log.write(
+                    self._log(
                         f"[red][{task.id}] ✗ TIMEOUT after {elapsed_s}s — "
                         f"subprocess killed[/]"
                     )
@@ -573,7 +623,7 @@ class PMAgentTUI(App):
             self._task_diffs[task.id] = diff
             self._save_diff_artifact(task.id, diff)
             stats = self._diff_stats(diff)
-            log.write(
+            self._log(
                 f"[bold magenta][{task.id}] diff:[/] "
                 f"+{stats['added']} -{stats['removed']} in {stats['files']} file(s)"
             )
@@ -581,7 +631,7 @@ class PMAgentTUI(App):
             # Day 8: only the worktree dir is removed here. The branch lives
             # until end-of-session so the integration step can merge it.
             await self.wm.acleanup_worktree(task.id)
-            log.write(f"[dim][{task.id}] worktree dir cleaned (branch kept)[/]")
+            self._log(f"[dim][{task.id}] worktree dir cleaned (branch kept)[/]")
 
     # ---------- artifacts ----------
     def _save_diff_artifact(self, task_id: str, diff: str) -> None:
@@ -739,13 +789,46 @@ class PMAgentTUI(App):
         # T-1 -> Coder-1, T-2 -> Coder-2 (matching ID convention)
         return task_id.replace("T-", "Coder-")
 
+    def _log(self, msg: str) -> None:
+        """RichLog.write with a left-aligned HH:MM:SS timestamp prefix."""
+        try:
+            log = self.query_one("#logs", RichLog)
+        except Exception:
+            return
+        ts = time.strftime("%H:%M:%S")
+        log.write(f"[dim]{ts}[/] {msg}")
+
+    @staticmethod
+    def _agent_card_text(name: str, status: str, action: str) -> str:
+        icon = STATUS_ICONS.get(status, "•")
+        return f"[bold]{icon} {name}[/]\n[dim]{action}[/]"
+
+    @staticmethod
+    def _status_cell(status: str) -> Text:
+        """Return a colored Rich Text cell for the task table Status column."""
+        colour = STATUS_COLORS.get(status, "white")
+        icon = STATUS_ICONS.get(status, "")
+        label = f"{icon} {status}".strip()
+        return Text(label, style=colour)
+
+    def _update_task_count(self) -> None:
+        try:
+            label = self.query_one("#task-count", Label)
+        except Exception:
+            return
+        if self.is_mock:
+            total = len(TASKS_MOCK)
+        else:
+            total = len(self._tasks)
+        label.update(f"{self._tasks_done}/{total} tasks")
+
     def _update_task_status(self, task_id: str, status: str) -> None:
         rk = self._task_rows.get(task_id)
         if rk is None:
             return
         try:
             table = self.query_one("#tasks", DataTable)
-            table.update_cell(rk, self._col_status, status)
+            table.update_cell(rk, self._col_status, self._status_cell(status))
         except Exception:
             pass  # best-effort; agent cards are the primary visual cue
 
@@ -754,7 +837,7 @@ class PMAgentTUI(App):
             card = self.query_one(f"#agent-{name}", Static)
         except Exception:
             return
-        card.update(f"[bold]{name}[/]\n[dim]{action}[/]")
+        card.update(self._agent_card_text(name, status, action))
         for cls in (
             "status-running", "status-done", "status-idle",
             "status-blocked", "status-failed",
@@ -769,8 +852,90 @@ class PMAgentTUI(App):
             f"cost: [bold green]${cost:.4f}[/]   "
             f"{count_label}: [bold cyan]{count:,}[/]   "
             f"elapsed: [bold]{elapsed_str}[/]   "
-            f"|   [dim]q to quit[/]"
+            f"|   [dim]q to quit · r to re-run[/]"
         )
+
+    # ---------- bindings ----------
+    def action_rerun(self) -> None:
+        """Re-run the session. Mock mode resets the ticker; real mode reruns
+        the planner + coders + integration. Refuses if a real-mode session is
+        still in flight (press q to abort first)."""
+        if self.is_mock:
+            self._tick_counter = 0
+            self._tasks_done = 0
+            self._event_count = 0
+            self._cost_usd = 0.0
+            self._start_time = time.time()
+            try:
+                progress = self.query_one("#progress", ProgressBar)
+                progress.update(progress=0)
+            except Exception:
+                pass
+            # Reset mock task rows back to their initial statuses.
+            try:
+                table = self.query_one("#tasks", DataTable)
+                for i, (_tid, _title, status) in enumerate(TASKS_MOCK):
+                    rk = table.coordinate_to_cell_key((i, 0)).row_key
+                    table.update_cell(rk, self._col_status, self._status_cell(status))
+            except Exception:
+                pass
+            self._update_task_count()
+            self._log("[yellow]↻ mock re-run[/]")
+            return
+
+        if not self._session_complete:
+            self._log(
+                "[yellow]↻ session still running; press q to abort first[/]"
+            )
+            return
+
+        self._log("[yellow]↻ re-running session...[/]")
+        # Per-run state reset.
+        self._tasks_done = 0
+        self._event_count = 0
+        self._cost_usd = 0.0
+        self._streamed_text = ""
+        self._task_diffs = {}
+        self._task_errors = {}
+        self._rate_limit_events = []
+        self._integration = None
+        self._session_complete = False
+        self._start_time = time.time()
+        self._run_id = time.strftime("%Y%m%d-%H%M%S")
+        self._artifacts_dir = ARTIFACTS_ROOT / self._run_id
+
+        try:
+            progress = self.query_one("#progress", ProgressBar)
+            progress.update(progress=0)
+        except Exception:
+            pass
+
+        # Clear task table — planner (or single-mode block below) will re-add.
+        try:
+            table = self.query_one("#tasks", DataTable)
+            table.clear()
+        except Exception:
+            table = None  # type: ignore[assignment]
+        self._task_rows = {}
+
+        # Reset agent cards to their initial states.
+        for name, status, action in AGENTS_INITIAL:
+            self._set_agent_status(name, status, action)
+
+        # In --single mode tasks are pre-populated and not re-decomposed; keep
+        # them and re-add their row.
+        if self.single and table is not None:
+            for t in self._tasks:
+                rk = table.add_row(t.id, t.title[:30], self._status_cell("ready"))
+                self._task_rows[t.id] = rk
+        elif not self.single:
+            # Real-planner mode: drop tasks so a stale list doesn't briefly
+            # show the old run's IDs while the planner thinks.
+            self._tasks = []
+
+        self._update_task_count()
+        # @work(exclusive=True) will cancel any lingering worker before starting.
+        self._run_session()
 
 
 def _ensure_target_repo(path: Path) -> Path:
