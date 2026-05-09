@@ -49,18 +49,24 @@ def _build_cmd(prompt: str, role: str | None, isolate: bool) -> list[str]:
 
 
 async def run_claude_async(
-    prompt: str, role: str | None = None, isolate: bool = True
+    prompt: str,
+    role: str | None = None,
+    isolate: bool = True,
+    cwd: str | None = None,
 ) -> AsyncIterator[dict]:
     """Spawn claude -p and yield each parsed stream-json event as a dict.
 
-    Caller drives consumption rate. Errors during parse are swallowed so a
-    malformed line doesn't kill the stream.
+    `cwd` selects the working directory for the subprocess — the orchestrator
+    points each Coder at its own git worktree so concurrent edits don't
+    collide. Caller drives consumption rate. Errors during parse are
+    swallowed so a malformed line doesn't kill the stream.
     """
     cmd = _build_cmd(prompt, role, isolate)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
     )
     assert proc.stdout is not None
     while True:

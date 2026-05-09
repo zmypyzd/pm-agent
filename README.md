@@ -26,13 +26,22 @@ uv run python -m pm_agent.runner "review this code" --role "You are a senior cod
 # TUI mock mode (day 2 — fake data, q to quit)
 uv run python -m pm_agent.tui
 
-# TUI real mode (day 3-4 — spawn claude -p and stream into right panel)
-uv run python -m pm_agent.tui "say only the word four"
+# TUI single-coder real mode (day 3-4)
+uv run python -m pm_agent.tui --single "say only the word four"
+
+# TUI multi-coder real mode (day 5 — 2 parallel Coders, each in its own worktree)
+uv run python -m pm_agent.tui "demo" --repo /tmp/pm-agent-target
 ```
 
 Snapshots:
 - `docs/tui-day2-snapshot.svg` — mock layout
-- `docs/tui-day3-real-snapshot.svg` — real claude streaming, 4 events, $0.057
+- `docs/tui-day3-real-snapshot.svg` — single-coder, 4 events, $0.057
+- `docs/tui-day5-multi-snapshot.svg` — 2 parallel coders, 8 events, $0.112, both worktrees cleaned
+
+Architecture:
+- `pm_agent/runner.py` — `run_claude_async(prompt, role, isolate, cwd)` async event stream
+- `pm_agent/worktree.py` — `WorktreeManager.{create,cleanup,acreate,acleanup}` for isolated parallel work
+- `pm_agent/tui.py` — Textual app, `@work` coroutine fan-out via `asyncio.gather` over `_stream_one(task)`
 
 ## Day 1 known issues / mitigations
 
