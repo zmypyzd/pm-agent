@@ -46,7 +46,7 @@ from textual.widgets import DataTable, Label, ProgressBar, RichLog, Static
 from pm_agent.planner import PlannerError, plan
 from pm_agent.runner import run_claude_async
 from pm_agent.tasks import CoderTask
-from pm_agent.worktree import WorktreeManager
+from pm_agent.worktree import IntegrationResult, WorktreeManager
 
 GOAL_MOCK = "Add room invite link API to werewolf platform (mock)"
 
@@ -177,12 +177,14 @@ class PMAgentTUI(App):
         repo: Path | None = None,
         single: bool = False,
         use_real_planner: bool = True,
+        test_cmd: str | None = None,
     ) -> None:
         super().__init__()
         self.goal = goal
         self.is_mock = goal is None
         self.single = single
         self.use_real_planner = use_real_planner
+        self.test_cmd = test_cmd
         self.repo = repo
         self.wm: WorktreeManager | None = None
         if not self.is_mock and repo is not None:
@@ -191,6 +193,7 @@ class PMAgentTUI(App):
         self._run_id: str = time.strftime("%Y%m%d-%H%M%S")
         self._artifacts_dir: Path = ARTIFACTS_ROOT / self._run_id
         self._task_diffs: dict[str, str] = {}
+        self._integration: IntegrationResult | None = None
 
     def compose(self) -> ComposeResult:
         display_goal = self.goal if self.goal else GOAL_MOCK
@@ -272,43 +275,113 @@ class PMAgentTUI(App):
     async def _run_session(self) -> None:
         log = self.query_one("#logs", RichLog)
         table = self.query_one("#tasks", DataTable)
+        try:
+            # Step 1: Planner (skipped in --single mode where tasks are pre-set)
+            if not self.single:
+                await self._run_planner(log, table)
 
-        # Step 1: Planner (skipped in --single mode where tasks are pre-set)
-        if not self.single:
-            await self._run_planner(log, table)
+            if not self._tasks:
+                log.write("[red]no tasks to run; aborting session[/]")
+                return
 
-        if not self._tasks:
-            log.write("[red]no tasks to run; aborting session[/]")
+            # Idle any coder card we won't use this run
+            for i in range(len(self._tasks) + 1, 3):
+                self._set_agent_status(f"Coder-{i}", "idle", "(unused this session)")
+            self._set_agent_status("Reviewer", "idle", "(needs result — day 7+)")
+
+            # Step 2: parallel Coders
+            results = await asyncio.gather(
+                *[self._stream_one(t) for t in self._tasks],
+                return_exceptions=True,
+            )
+
+            for t, r in zip(self._tasks, results):
+                if isinstance(r, Exception):
+                    log.write(f"[red][{t.id}] failed: {r}[/]")
+                    self._update_task_status(t.id, "failed")
+                    self._set_agent_status(
+                        self._coder_card(t.id), "failed", f"{t.id} crashed"
+                    )
+
+            log.write(
+                f"[bold green]✓ all coders finished[/] "
+                f"total cost ${self._cost_usd:.4f} "
+                f"in {time.time() - self._start_time:.1f}s"
+            )
+
+            # Step 3: integration (skip --single mode; nothing to merge)
+            if not self.single and self.wm and self._tasks:
+                await self._run_integration(log)
+
+            summary_path = self._write_run_summary()
+            log.write(f"[bold green]→ run summary:[/] {summary_path}")
+        finally:
+            # Cleanup task branches + integration branch even if cancelled.
+            await self._cleanup_branches()
+            self._session_complete = True
+
+    async def _run_integration(self, log: RichLog) -> None:
+        assert self.wm is not None
+        log.write(
+            f"[bold cyan][Integrator][/] merging "
+            f"{', '.join(t.id for t in self._tasks)} into "
+            f"ai/integration/{self._run_id}"
+        )
+        try:
+            self._integration = await self.wm.aintegrate(
+                self._run_id, [t.id for t in self._tasks], test_cmd=self.test_cmd
+            )
+        except Exception as e:
+            log.write(f"[red][Integrator] crashed:[/] {type(e).__name__}: {e}")
             return
 
-        # Idle any coder card we won't use this run
-        for i in range(len(self._tasks) + 1, 3):
-            self._set_agent_status(f"Coder-{i}", "idle", "(unused this session)")
-        self._set_agent_status("Reviewer", "idle", "(needs result — day 7+)")
+        ig = self._integration
+        if ig.conflicts:
+            log.write(
+                f"[red][Integrator] {len(ig.conflicts)} conflict(s):[/] "
+                + ", ".join(c["task_id"] for c in ig.conflicts)
+            )
+            for c in ig.conflicts:
+                log.write(f"[red]  {c['task_id']}: {c['output'].splitlines()[0][:100]}[/]")
+        else:
+            log.write(
+                f"[green][Integrator] ✓ merged {len(ig.merged_tasks)} branch(es) clean[/]"
+            )
+            stats = self._diff_stats(ig.diff_against_base)
+            log.write(
+                f"[dim][Integrator] integrated diff: "
+                f"+{stats['added']} -{stats['removed']} in {stats['files']} file(s)[/]"
+            )
 
-        # Step 2: parallel Coders
-        results = await asyncio.gather(
-            *[self._stream_one(t) for t in self._tasks],
-            return_exceptions=True,
-        )
+        if ig.test_result is not None:
+            tr = ig.test_result
+            ok = tr["exit_code"] == 0
+            colour = "green" if ok else "red"
+            log.write(
+                f"[bold {colour}][Integrator] tests "
+                f"{'PASS' if ok else 'FAIL'}[/] "
+                f"({tr['command']!r} → exit {tr['exit_code']})"
+            )
 
-        for t, r in zip(self._tasks, results):
-            if isinstance(r, Exception):
-                log.write(f"[red][{t.id}] failed: {r}[/]")
-                self._update_task_status(t.id, "failed")
-                self._set_agent_status(
-                    self._coder_card(t.id), "failed", f"{t.id} crashed"
-                )
+        # Save the integrated diff as an artifact
+        self._artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (self._artifacts_dir / "integration.diff").write_text(ig.diff_against_base)
 
-        log.write(
-            f"[bold green]✓ all coders finished[/] "
-            f"total cost ${self._cost_usd:.4f} "
-            f"in {time.time() - self._start_time:.1f}s"
-        )
-
-        summary_path = self._write_run_summary()
-        log.write(f"[bold green]→ run summary:[/] {summary_path}")
-        self._session_complete = True
+    async def _cleanup_branches(self) -> None:
+        if self.wm is None:
+            return
+        # Best-effort delete of task branches.
+        for t in self._tasks:
+            try:
+                await self.wm.adelete_branch(t.id)
+            except Exception:
+                pass
+        # Integration worktree + branch (if it was created).
+        if self._integration is not None:
+            try:
+                await self.wm.acleanup_integration(self._integration)
+            except Exception:
+                pass
 
     async def _run_planner(self, log: RichLog, table: DataTable) -> None:
         """Decompose self.goal into self._tasks. Falls back to mock on error."""
@@ -440,8 +513,10 @@ class PMAgentTUI(App):
                 f"+{stats['added']} -{stats['removed']} in {stats['files']} file(s)"
             )
         finally:
-            await self.wm.acleanup(task.id)
-            log.write(f"[dim][{task.id}] worktree cleaned[/]")
+            # Day 8: only the worktree dir is removed here. The branch lives
+            # until end-of-session so the integration step can merge it.
+            await self.wm.acleanup_worktree(task.id)
+            log.write(f"[dim][{task.id}] worktree dir cleaned (branch kept)[/]")
 
     # ---------- artifacts ----------
     def _save_diff_artifact(self, task_id: str, diff: str) -> None:
@@ -476,8 +551,30 @@ class PMAgentTUI(App):
             f"- **total cost**: ${self._cost_usd:.4f}",
             f"- **duration**: {time.time() - self._start_time:.1f}s",
             f"- **tasks completed**: {self._tasks_done}/{len(self._tasks)}",
-            "",
         ]
+
+        if self._integration is not None:
+            ig = self._integration
+            if ig.conflicts:
+                out.append(
+                    f"- **integration**: ❌ {len(ig.conflicts)} conflict(s) on "
+                    + ", ".join(c["task_id"] for c in ig.conflicts)
+                )
+            elif ig.merged_tasks:
+                out.append(
+                    f"- **integration**: ✅ merged "
+                    f"{', '.join(ig.merged_tasks)} into {ig.branch}"
+                )
+            if ig.test_result is not None:
+                tr = ig.test_result
+                ok = tr["exit_code"] == 0
+                out.append(
+                    f"- **integration tests**: "
+                    f"{'✅ PASS' if ok else '❌ FAIL'} "
+                    f"({tr['command']!r} → exit {tr['exit_code']})"
+                )
+        out.append("")
+
         for t in self._tasks:
             diff = self._task_diffs.get(t.id, "")
             stats = self._diff_stats(diff) if diff else {"added": 0, "removed": 0, "files": 0}
@@ -494,6 +591,62 @@ class PMAgentTUI(App):
             for c in t.acceptance:
                 out.append(f"- {c}")
             out += ["", "<details><summary>diff</summary>", "", "```diff", diff[:8000], "```", "", "</details>", ""]
+
+        if self._integration is not None:
+            ig = self._integration
+            out += [
+                "## Integration",
+                "",
+                f"- **branch**: {ig.branch}",
+                f"- **merged**: {', '.join(ig.merged_tasks) or '(none)'}",
+            ]
+            if ig.conflicts:
+                out += [
+                    "- **conflicts**:",
+                ]
+                for c in ig.conflicts:
+                    out.append(f"  - **{c['task_id']}**: {c['output'].splitlines()[0][:160]}")
+            if ig.test_result is not None:
+                tr = ig.test_result
+                out += [
+                    "",
+                    f"### Tests: {'PASS' if tr['exit_code'] == 0 else 'FAIL'}",
+                    "",
+                    f"- **command**: `{tr['command']}`",
+                    f"- **exit_code**: {tr['exit_code']}",
+                    "",
+                    "<details><summary>stdout (tail)</summary>",
+                    "",
+                    "```",
+                    tr["stdout"] or "(empty)",
+                    "```",
+                    "",
+                    "</details>",
+                    "",
+                ]
+                if tr["stderr"]:
+                    out += [
+                        "<details><summary>stderr (tail)</summary>",
+                        "",
+                        "```",
+                        tr["stderr"],
+                        "```",
+                        "",
+                        "</details>",
+                        "",
+                    ]
+            out += [
+                "",
+                "<details><summary>integrated diff (vs base)</summary>",
+                "",
+                "```diff",
+                ig.diff_against_base[:12000],
+                "```",
+                "",
+                "</details>",
+                "",
+            ]
+
         path = self._artifacts_dir / "summary.md"
         path.write_text("\n".join(out))
         return path
@@ -576,6 +729,12 @@ def main() -> None:
         action="store_true",
         help="skip the real claude-driven planner, use the cheap mock fallback",
     )
+    ap.add_argument(
+        "--test-cmd",
+        default=None,
+        help="shell command to run inside the integration worktree after a clean merge "
+             "(e.g. 'pytest tests/' or 'python3 -m unittest discover')",
+    )
     args = ap.parse_args()
 
     goal = " ".join(args.goal).strip() or None
@@ -589,6 +748,7 @@ def main() -> None:
         repo=repo,
         single=args.single,
         use_real_planner=not args.mock_planner,
+        test_cmd=args.test_cmd,
     ).run()
 
 

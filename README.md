@@ -42,11 +42,17 @@ git init -q && echo init > README.md && git add . && git commit -q -m init
 cd -
 uv run python -m pm_agent.tui --repo /tmp/pm-agent-day7-target "Add /health endpoint to handle_request returning {status: ok} as a dict, plus a test"
 
+# Day-8: also auto-merge into ai/integration/<run-id> and run tests on the merged tree
+uv run python -m pm_agent.tui \
+  --repo /tmp/pm-agent-day7-target \
+  --test-cmd "python3 -c 'import tests.test_server as t; [getattr(t,n)() for n in dir(t) if n.startswith(\"test_\")]; print(\"PASS\")'" \
+  "Add /version endpoint returning v1 plus a test"
+
 # After the run completes:
-ls ~/.pm-agent/runs/                         # one dir per run
-cat ~/.pm-agent/runs/<latest>/summary.md     # PR-style report with diffs
-git -C /tmp/pm-agent-day7-target apply ~/.pm-agent/runs/<latest>/T-1.diff
-git -C /tmp/pm-agent-day7-target apply ~/.pm-agent/runs/<latest>/T-2.diff
+ls ~/.pm-agent/runs/                                # one dir per run
+cat ~/.pm-agent/runs/<latest>/summary.md            # PR-style report
+cat ~/.pm-agent/runs/<latest>/integration.diff      # the merged proposal
+git -C /tmp/pm-agent-day7-target apply ~/.pm-agent/runs/<latest>/integration.diff
 ```
 
 Snapshots:
