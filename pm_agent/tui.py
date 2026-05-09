@@ -1,20 +1,21 @@
 """TUI for pm-agent.
 
-Three modes:
+Modes:
 
-  1. Mock mode (no goal argv): day-2 ticker over fake data. Useful for
-     layout tweaks without burning API.
+  1. Mock mode (no goal argv): day-2 ticker over fake data.
        uv run python -m pm_agent.tui
 
   2. Single-coder real mode (--single): day-3/4 wiring. One claude -p
      subprocess streams into the right panel.
        uv run python -m pm_agent.tui --single "what is 2+2"
 
-  3. Multi-coder real mode (default for non-mock): day-5 wiring.
-     A mock planner decomposes the goal into 2 fixed subtasks; two
-     Coders run in parallel, each in its own git worktree. Streams
-     interleave in the live log, prefixed by task id.
-       uv run python -m pm_agent.tui "anything you want" --repo /tmp/scratch
+  3. Multi-coder mode (default for non-mock): day-6 wiring.
+     A real Planner agent (claude with structured-YAML system prompt)
+     decomposes the goal into 2 file-disjoint subtasks; two Coders run
+     in parallel, each in its own git worktree. Falls back to
+     mock_planner_decompose if Planner fails parse/validation.
+       uv run python -m pm_agent.tui "add cost CSV export"
+     Force fast mock planner with --mock-planner.
 
 Five panels (per design doc):
   top    — goal + progress bar (advances as tasks complete)
@@ -42,7 +43,9 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Label, ProgressBar, RichLog, Static
 
+from pm_agent.planner import PlannerError, plan
 from pm_agent.runner import run_claude_async
+from pm_agent.tasks import CoderTask
 from pm_agent.worktree import WorktreeManager
 
 GOAL_MOCK = "Add room invite link API to werewolf platform (mock)"
@@ -71,30 +74,23 @@ MOCK_LOG_LINES = [
 ]
 
 
-@dataclass
-class CoderTask:
-    id: str
-    title: str
-    prompt: str
-
-
 def mock_planner_decompose(goal: str) -> list[CoderTask]:
-    """Day-5 placeholder for a real Planner agent.
-
-    Returns 2 short, parallelizable subtasks. Day-6 replaces this with a
-    real claude-driven planner that reads the goal + repo and emits a
-    YAML task DAG.
-    """
+    """Cheap fallback when --mock-planner is set or the real planner errors.
+    Returns 2 trivially parallelizable subtasks."""
     return [
         CoderTask(
             id="T-1",
             title="Explain asyncio.gather",
             prompt="In 5 words, what does asyncio.gather do?",
+            allowed_paths=["mock/T-1/**"],
+            acceptance=["claude returns a 5-word string"],
         ),
         CoderTask(
             id="T-2",
             title="Explain git worktree",
             prompt="In 5 words, what does git worktree do?",
+            allowed_paths=["mock/T-2/**"],
+            acceptance=["claude returns a 5-word string"],
         ),
     ]
 
@@ -164,11 +160,13 @@ class PMAgentTUI(App):
         goal: str | None = None,
         repo: Path | None = None,
         single: bool = False,
+        use_real_planner: bool = True,
     ) -> None:
         super().__init__()
         self.goal = goal
         self.is_mock = goal is None
         self.single = single
+        self.use_real_planner = use_real_planner
         self.repo = repo
         self.wm: WorktreeManager | None = None
         if not self.is_mock and repo is not None:
@@ -219,20 +217,20 @@ class PMAgentTUI(App):
         log.write(f"[dim]goal:[/] {self.goal}")
         log.write(f"[dim]target repo:[/] {self.repo}")
 
+        # Note: tasks are populated AFTER planner runs (or right now if --single).
         if self.single:
             self._tasks = [
-                CoderTask(id="T-1", title="single goal", prompt=self.goal or "")
+                CoderTask(
+                    id="T-1",
+                    title="single goal",
+                    prompt=self.goal or "",
+                    allowed_paths=["**"],
+                    acceptance=["claude exits cleanly"],
+                )
             ]
-        else:
-            self._tasks = mock_planner_decompose(self.goal or "")
-            log.write(
-                f"[cyan][Planner mock][/] decomposed into "
-                f"{len(self._tasks)} parallel subtasks"
-            )
-
-        for t in self._tasks:
-            rk = table.add_row(t.id, t.title[:30], "ready")
-            self._task_rows[t.id] = rk
+            for t in self._tasks:
+                rk = table.add_row(t.id, t.title[:30], "ready")
+                self._task_rows[t.id] = rk
 
         self._run_session()
 
@@ -254,13 +252,22 @@ class PMAgentTUI(App):
     @work(exclusive=True)
     async def _run_session(self) -> None:
         log = self.query_one("#logs", RichLog)
-        # Mark non-Coder cards as "out of scope this session"
-        self._set_agent_status("Planner",  "done", "Decomposition complete (mock)")
-        self._set_agent_status("Reviewer", "idle", "(needs result — day 7+)")
-        # Idle any coder card we won't use
+        table = self.query_one("#tasks", DataTable)
+
+        # Step 1: Planner (skipped in --single mode where tasks are pre-set)
+        if not self.single:
+            await self._run_planner(log, table)
+
+        if not self._tasks:
+            log.write("[red]no tasks to run; aborting session[/]")
+            return
+
+        # Idle any coder card we won't use this run
         for i in range(len(self._tasks) + 1, 3):
             self._set_agent_status(f"Coder-{i}", "idle", "(unused this session)")
+        self._set_agent_status("Reviewer", "idle", "(needs result — day 7+)")
 
+        # Step 2: parallel Coders
         results = await asyncio.gather(
             *[self._stream_one(t) for t in self._tasks],
             return_exceptions=True,
@@ -278,6 +285,55 @@ class PMAgentTUI(App):
             f"[bold green]✓ all coders finished[/] "
             f"total cost ${self._cost_usd:.4f} "
             f"in {time.time() - self._start_time:.1f}s"
+        )
+
+    async def _run_planner(self, log: RichLog, table: DataTable) -> None:
+        """Decompose self.goal into self._tasks. Falls back to mock on error."""
+        used_mock = False
+        if self.use_real_planner:
+            self._set_agent_status(
+                "Planner", "running", "calling claude with YAML system prompt"
+            )
+            log.write("[bold cyan][Planner][/] decomposing goal...")
+            try:
+                tasks, planner_cost = await plan(self.goal or "", self.repo)  # type: ignore[arg-type]
+                self._tasks = tasks
+                self._cost_usd += planner_cost
+                log.write(
+                    f"[green][Planner] ✓ {len(tasks)} tasks, "
+                    f"cost ${planner_cost:.4f}[/]"
+                )
+            except PlannerError as e:
+                log.write(f"[red][Planner] failed:[/] {e}")
+                log.write("[yellow][Planner] falling back to mock decomposer[/]")
+                self._tasks = mock_planner_decompose(self.goal or "")
+                used_mock = True
+            except Exception as e:
+                log.write(f"[red][Planner] crashed:[/] {type(e).__name__}: {e}")
+                log.write("[yellow][Planner] falling back to mock decomposer[/]")
+                self._tasks = mock_planner_decompose(self.goal or "")
+                used_mock = True
+        else:
+            log.write("[cyan][Planner mock][/] --mock-planner set, skipping real call")
+            self._tasks = mock_planner_decompose(self.goal or "")
+            used_mock = True
+
+        # Update task table now that we have real tasks
+        for t in self._tasks:
+            rk = table.add_row(t.id, t.title[:30], "ready")
+            self._task_rows[t.id] = rk
+
+        # Surface acceptance + paths in the log so user can verify the plan
+        for t in self._tasks:
+            log.write(
+                f"[dim]  {t.id} paths:[/] {', '.join(t.allowed_paths) or '(none)'}"
+            )
+            for crit in t.acceptance[:3]:
+                log.write(f"[dim]  {t.id} accept:[/] {crit}")
+
+        label = "mock" if used_mock else "real claude"
+        self._set_agent_status(
+            "Planner", "done", f"{label}: decomposed into {len(self._tasks)}"
         )
 
     async def _stream_one(self, task: CoderTask) -> None:
@@ -410,6 +466,11 @@ def main() -> None:
         action="store_true",
         help="single-coder mode (day 3-4 behavior); ignores planner decomposition",
     )
+    ap.add_argument(
+        "--mock-planner",
+        action="store_true",
+        help="skip the real claude-driven planner, use the cheap mock fallback",
+    )
     args = ap.parse_args()
 
     goal = " ".join(args.goal).strip() or None
@@ -418,7 +479,12 @@ def main() -> None:
         return
 
     repo = _ensure_target_repo(args.repo)
-    PMAgentTUI(goal=goal, repo=repo, single=args.single).run()
+    PMAgentTUI(
+        goal=goal,
+        repo=repo,
+        single=args.single,
+        use_real_planner=not args.mock_planner,
+    ).run()
 
 
 if __name__ == "__main__":

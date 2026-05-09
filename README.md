@@ -29,19 +29,25 @@ uv run python -m pm_agent.tui
 # TUI single-coder real mode (day 3-4)
 uv run python -m pm_agent.tui --single "say only the word four"
 
-# TUI multi-coder real mode (day 5 — 2 parallel Coders, each in its own worktree)
-uv run python -m pm_agent.tui "demo" --repo /tmp/pm-agent-target
+# TUI multi-coder + real Planner (day 6 — Planner LLM call decomposes goal into YAML)
+uv run python -m pm_agent.tui "Add JSONL logger for each claude call"
+
+# Skip the real Planner for cheap iteration:
+uv run python -m pm_agent.tui "demo" --mock-planner
 ```
 
 Snapshots:
 - `docs/tui-day2-snapshot.svg` — mock layout
 - `docs/tui-day3-real-snapshot.svg` — single-coder, 4 events, $0.057
-- `docs/tui-day5-multi-snapshot.svg` — 2 parallel coders, 8 events, $0.112, both worktrees cleaned
+- `docs/tui-day5-multi-snapshot.svg` — 2 parallel coders (mock plan), 8 events, $0.112
+- `docs/tui-day6-planner-snapshot.svg` — real Planner emits 2 file-disjoint YAML tasks
 
 Architecture:
+- `pm_agent/tasks.py` — shared `CoderTask` schema (id / title / prompt / allowed_paths / acceptance)
 - `pm_agent/runner.py` — `run_claude_async(prompt, role, isolate, cwd)` async event stream
 - `pm_agent/worktree.py` — `WorktreeManager.{create,cleanup,acreate,acleanup}` for isolated parallel work
-- `pm_agent/tui.py` — Textual app, `@work` coroutine fan-out via `asyncio.gather` over `_stream_one(task)`
+- `pm_agent/planner.py` — `plan(goal, repo)` calls claude with strict YAML system prompt; parser tolerates fenced/naked YAML and strips backticks defensively
+- `pm_agent/tui.py` — Textual app, Planner runs first (with mock fallback on PlannerError), then `asyncio.gather` over `_stream_one(task)` per Coder
 
 ## Day 1 known issues / mitigations
 
