@@ -195,6 +195,8 @@ class PMAgentTUI(App):
         self._run_id: str = time.strftime("%Y%m%d-%H%M%S")
         self._artifacts_dir: Path = ARTIFACTS_ROOT / self._run_id
         self._task_diffs: dict[str, str] = {}
+        self._task_errors: dict[str, str] = {}
+        self._rate_limit_events: list[dict] = []
         self._integration: IntegrationResult | None = None
 
     def compose(self) -> ComposeResult:
@@ -503,16 +505,51 @@ class PMAgentTUI(App):
                     cost = ev.get("total_cost_usd") or 0.0
                     dur = ev.get("duration_ms") or 0
                     self._cost_usd += float(cost)
-                    log.write(
-                        f"[green][{task.id}] ✓ result[/] "
-                        f"cost=${float(cost):.4f} dur={dur}ms"
-                    )
-                    self._tasks_done += 1
-                    self._update_task_status(task.id, "done")
-                    self._set_agent_status(coder_card, "done", f"{task.id}: complete")
+                    is_error = bool(ev.get("is_error"))
+                    if is_error:
+                        # API-side failure: auth, rate limit, network, etc.
+                        # Don't mark done; surface the error reason.
+                        reason = (
+                            ev.get("result")
+                            or ev.get("api_error_status")
+                            or "unknown api error"
+                        )
+                        self._task_errors[task.id] = str(reason)[:300]
+                        log.write(
+                            f"[red][{task.id}] ✗ API ERROR[/] "
+                            f"reason={str(reason)[:120]}"
+                        )
+                        log.write(
+                            f"[dim][{task.id}] cost=${float(cost):.4f} dur={dur}ms[/]"
+                        )
+                        self._update_task_status(task.id, "api_error")
+                        self._set_agent_status(
+                            coder_card, "failed", f"{task.id}: API error"
+                        )
+                    else:
+                        log.write(
+                            f"[green][{task.id}] ✓ result[/] "
+                            f"cost=${float(cost):.4f} dur={dur}ms"
+                        )
+                        self._tasks_done += 1
+                        self._update_task_status(task.id, "done")
+                        self._set_agent_status(
+                            coder_card, "done", f"{task.id}: complete"
+                        )
                     progress.update(
-                        progress=int(100 * self._tasks_done / max(1, len(self._tasks)))
+                        progress=int(
+                            100 * self._tasks_done / max(1, len(self._tasks))
+                        )
                     )
+                elif et == "rate_limit_event":
+                    info = ev.get("rate_limit_info", {}) or {}
+                    self._rate_limit_events.append(info)
+                    status = info.get("status")
+                    if status and status != "allowed":
+                        log.write(
+                            f"[yellow][{task.id}] ⚠ rate-limit {status} "
+                            f"(reset @ {info.get('resetsAt')})[/]"
+                        )
                 elif et == "system" and ev.get("subtype") == "timeout":
                     elapsed_s = ev.get("elapsed_s")
                     log.write(
@@ -603,15 +640,32 @@ class PMAgentTUI(App):
                 )
         out.append("")
 
+        if self._rate_limit_events:
+            non_allowed = [
+                e for e in self._rate_limit_events
+                if (e.get("status") or "allowed") != "allowed"
+            ]
+            if non_allowed:
+                out.append(
+                    f"- **rate-limit hits**: {len(non_allowed)} non-allowed "
+                    f"(of {len(self._rate_limit_events)} total)"
+                )
+
         for t in self._tasks:
             diff = self._task_diffs.get(t.id, "")
             stats = self._diff_stats(diff) if diff else {"added": 0, "removed": 0, "files": 0}
+            err = self._task_errors.get(t.id)
+            status_str = "❌ API ERROR" if err else "✓ done"
             out += [
-                f"## {t.id}: {t.title}",
+                f"## {t.id}: {t.title}  ({status_str})",
                 "",
                 f"- **branch**: ai/{t.id}",
                 f"- **diff**: +{stats['added']} -{stats['removed']} lines, {stats['files']} file(s)",
                 f"- **allowed_paths**: {', '.join(t.allowed_paths) or '(none)'}",
+            ]
+            if err:
+                out.append(f"- **error**: {err}")
+            out += [
                 "",
                 "**acceptance criteria:**",
                 "",
