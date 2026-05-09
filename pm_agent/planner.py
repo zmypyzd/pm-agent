@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 import yaml
 
@@ -98,6 +99,18 @@ REPO TRACKED FILES:
 {files}
 
 Produce the YAML now.
+"""
+
+
+PLANNER_RETRY_PREFIX = """\
+Your previous YAML output failed to parse with this error:
+
+  {error}
+
+Re-emit the YAML, fixing that specific issue. Same goal and context apply.
+Remember the rules: no backticks, no curly braces, no square brackets, no
+markdown inside string values.
+
 """
 
 
@@ -181,13 +194,14 @@ def validate_disjoint(tasks: list[CoderTask]) -> None:
             claimed[path] = t.id
 
 
-async def plan(goal: str, repo: Path) -> tuple[list[CoderTask], float]:
-    """Run the planner. Returns (tasks, planner_cost_usd).
-
-    Raises PlannerError on parse/validation failure.
-    """
+async def _call_planner_once(
+    goal: str, repo: Path, retry_feedback: str | None = None
+) -> tuple[str, float]:
+    """One LLM call. Returns (raw_text, cost_usd). No parsing."""
     context = build_repo_context(repo)
     user_prompt = PLANNER_USER.format(goal=goal, files=context)
+    if retry_feedback:
+        user_prompt = PLANNER_RETRY_PREFIX.format(error=retry_feedback) + user_prompt
     chunks: list[str] = []
     cost: float = 0.0
     async for ev in run_claude_async(
@@ -203,12 +217,43 @@ async def plan(goal: str, repo: Path) -> tuple[list[CoderTask], float]:
                     chunks.append(part["text"])
         elif et == "result":
             cost = float(ev.get("total_cost_usd") or 0.0)
+    return "".join(chunks), cost
 
-    text = "".join(chunks)
-    if not text.strip():
-        raise PlannerError("planner returned empty response")
 
-    yaml_block = extract_yaml(text)
-    tasks = parse_tasks(yaml_block)
-    validate_disjoint(tasks)
-    return tasks, cost
+async def plan(
+    goal: str,
+    repo: Path,
+    max_retries: int = 2,
+    on_retry: "Callable[[int, str], None] | None" = None,
+) -> tuple[list[CoderTask], float]:
+    """Run the planner with up to `max_retries` self-correcting attempts.
+
+    On a PlannerError, the next attempt prepends the error message to the
+    user prompt, asking claude to fix it. Cost accumulates across attempts.
+    `on_retry(attempt_num, last_error)` fires before each retry attempt
+    (1-indexed). Final failure raises PlannerError with cumulative context.
+    """
+    total_cost = 0.0
+    last_error: str | None = None
+    for attempt in range(max_retries + 1):
+        if attempt > 0 and on_retry is not None:
+            on_retry(attempt, last_error or "(unknown)")
+        text, cost = await _call_planner_once(goal, repo, retry_feedback=last_error)
+        total_cost += cost
+        if not text.strip():
+            last_error = "planner returned empty response"
+            continue
+        try:
+            yaml_block = extract_yaml(text)
+            tasks = parse_tasks(yaml_block)
+            validate_disjoint(tasks)
+            return tasks, total_cost
+        except PlannerError as e:
+            last_error = str(e)
+            if attempt == max_retries:
+                raise PlannerError(
+                    f"planner failed after {attempt + 1} attempt(s). "
+                    f"Last error: {e}"
+                ) from e
+    # Unreachable due to raise above, but mypy/etc want it.
+    raise PlannerError(f"planner exhausted retries: {last_error}")

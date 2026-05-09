@@ -393,8 +393,21 @@ class PMAgentTUI(App):
                 "Planner", "running", "calling claude with YAML system prompt"
             )
             log.write("[bold cyan][Planner][/] decomposing goal...")
+
+            def _on_retry(attempt: int, error: str) -> None:
+                log.write(
+                    f"[yellow][Planner] retry {attempt}: previous output "
+                    f"failed parse[/]"
+                )
+                log.write(f"[dim][Planner]   error: {error[:120]}[/]")
+                self._set_agent_status(
+                    "Planner", "running", f"retry {attempt} with error feedback"
+                )
+
             try:
-                tasks, planner_cost = await plan(self.goal or "", self.repo)  # type: ignore[arg-type]
+                tasks, planner_cost = await plan(
+                    self.goal or "", self.repo, on_retry=_on_retry
+                )  # type: ignore[arg-type]
                 self._tasks = tasks
                 self._cost_usd += planner_cost
                 log.write(
