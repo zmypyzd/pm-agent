@@ -34,10 +34,12 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
+from rich.markup import escape as _rich_escape
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
@@ -77,7 +79,6 @@ AGENTS_INITIAL = [
     ("Planner",  "done",     "Decomposed into 3 tasks"),
     ("Coder-1",  "running",  "Editing server/rooms/api.py"),
     ("Coder-2",  "running",  "Writing tests for invite expiry"),
-    ("Reviewer", "idle",     "Waiting for coders"),
 ]
 
 TASKS_MOCK = [
@@ -107,6 +108,44 @@ When you finish making your code changes:
 If you made no file changes, instead print: NO_CHANGES
 Stay strictly inside this worktree directory. Do not push, do not switch branches.
 """
+
+
+# BUG-006: Coder needs to know its sandbox boundary explicitly. Without this,
+# the Coder happily writes outside its allowed_paths and the merge step
+# catches the conflict after the cost was already burned.
+#
+# Tone matters: a too-strict "stop and explain" wording made the Coder bail
+# when a sibling task's output was needed (e.g. T-2's test needs T-1's
+# /health). We soften to "prefer the allowed paths; do your task even if
+# external state isn't yet present — other Coders may be working in
+# parallel".
+CODER_CONSTRAINTS_PREFIX = """\
+TASK BOUNDARY (read first):
+  You are Coder for task {task_id}, running in parallel with sibling Coders.
+  Allowed paths — prefer editing only these:
+{allowed_paths_block}
+  Acceptance criteria — your output must satisfy:
+{acceptance_block}
+
+Sibling Coders may be modifying other files concurrently in their own git
+worktrees. Trust them to produce what your acceptance criteria reference
+(routes, modules, fixtures). Write your code as if their work is in place.
+Stay within the Allowed paths whenever the task allows it; do not create
+unrelated files outside that list.
+
+---
+
+YOUR TASK:
+
+"""
+
+
+def _safe(s: object) -> str:
+    """Escape user / LLM-controlled strings for Rich markup contexts (BUG-039 / 053).
+    Returns the input rendered as literal text so '[red]EVIL[/]' shows as
+    '[red]EVIL[/]' rather than red EVIL.
+    """
+    return _rich_escape(str(s))
 
 
 ARTIFACTS_ROOT = Path.home() / ".pm-agent" / "runs"
@@ -223,9 +262,13 @@ class PMAgentTUI(App):
         coder_timeout: float = 180.0,
         inject_fault: str | None = None,
         interactive: bool = False,
+        max_retries: int = 2,
+        test_timeout: float = 120.0,
     ) -> None:
         super().__init__()
         self.goal = goal
+        self.max_retries = max_retries
+        self.test_timeout = test_timeout
         # Day 15: interactive mode lets the user type goals in a TUI Input
         # widget and run them back-to-back without restarting the process.
         # With interactive=True we are NOT in mock mode even when goal=None;
@@ -244,7 +287,7 @@ class PMAgentTUI(App):
         if not self.is_mock and repo is not None:
             self.wm = WorktreeManager(repo)
         self._tasks: list[CoderTask] = []
-        self._run_id: str = time.strftime("%Y%m%d-%H%M%S")
+        self._run_id: str = (time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4])
         self._artifacts_dir: Path = ARTIFACTS_ROOT / self._run_id
         self._task_diffs: dict[str, str] = {}
         self._task_errors: dict[str, str] = {}
@@ -312,7 +355,7 @@ class PMAgentTUI(App):
             return
 
         self._log("[green]pm-agent TUI started (real mode)[/]")
-        self._log(f"[dim]target repo:[/] {self.repo}")
+        self._log(f"[dim]target repo:[/] {_safe(self.repo)}")
         if self.interactive:
             self._log(
                 "[cyan]interactive mode — type a goal in the input bar and press Enter[/]"
@@ -328,7 +371,7 @@ class PMAgentTUI(App):
                 pass
             return
 
-        self._log(f"[dim]goal:[/] {self.goal}")
+        self._log(f"[dim]goal:[/] {_safe(self.goal)}")
 
         # Note: tasks are populated AFTER planner runs (or right now if --single).
         if self.single:
@@ -390,10 +433,12 @@ class PMAgentTUI(App):
                 self._log("[red]no tasks to run; aborting session[/]")
                 return
 
-            # Idle any coder card we won't use this run
-            for i in range(len(self._tasks) + 1, 3):
+            # Idle any preallocated Coder slot we won't use this run. The TUI
+            # statically wires Coder-1 and Coder-2 in AGENTS_INITIAL; if the
+            # planner returns fewer than 2 tasks, mark the spare card idle.
+            MAX_CODERS = 2
+            for i in range(len(self._tasks) + 1, MAX_CODERS + 1):
                 self._set_agent_status(f"Coder-{i}", "idle", "(unused this session)")
-            self._set_agent_status("Reviewer", "idle", "(needs result — day 7+)")
 
             # Step 2: parallel Coders
             results = await asyncio.gather(
@@ -435,10 +480,11 @@ class PMAgentTUI(App):
         )
         try:
             self._integration = await self.wm.aintegrate(
-                self._run_id, [t.id for t in self._tasks], test_cmd=self.test_cmd
+                self._run_id, [t.id for t in self._tasks],
+                test_cmd=self.test_cmd, test_timeout=self.test_timeout,
             )
         except Exception as e:
-            self._log(f"[red][Integrator] crashed:[/] {type(e).__name__}: {e}")
+            self._log(f"[red][Integrator] crashed:[/] {type(e).__name__}: {_safe(e)}")
             return
 
         ig = self._integration
@@ -476,18 +522,27 @@ class PMAgentTUI(App):
     async def _cleanup_branches(self) -> None:
         if self.wm is None:
             return
-        # Best-effort delete of task branches.
+        # Best-effort delete of task branches. BUG-019: previously silent on
+        # failure; now surface to the live log so accumulated junk branches
+        # don't pile up unnoticed.
         for t in self._tasks:
             try:
                 await self.wm.adelete_branch(t.id)
-            except Exception:
-                pass
+            except Exception as e:
+                self._log(
+                    f"[yellow]cleanup: could not delete branch ai/{_safe(t.id)}: "
+                    f"{type(e).__name__}: {_safe(e)}[/]"
+                )
         # Integration worktree + branch (if it was created).
         if self._integration is not None:
             try:
                 await self.wm.acleanup_integration(self._integration)
-            except Exception:
-                pass
+            except Exception as e:
+                self._log(
+                    f"[yellow]cleanup: could not remove integration worktree "
+                    f"{_safe(self._integration.branch)}: "
+                    f"{type(e).__name__}: {_safe(e)}[/]"
+                )
 
     async def _run_planner(self, table: DataTable) -> None:
         """Decompose self.goal into self._tasks. Falls back to mock on error."""
@@ -517,6 +572,7 @@ class PMAgentTUI(App):
                 tasks, planner_cost = await plan(
                     self.goal or "",
                     self.repo,
+                    max_retries=self.max_retries,
                     on_retry=_on_retry,
                     simulate_failures=sim_failures,
                 )  # type: ignore[arg-type]
@@ -529,7 +585,7 @@ class PMAgentTUI(App):
             except PlannerError as e:
                 self._artifacts_dir.mkdir(parents=True, exist_ok=True)
                 (self._artifacts_dir / "planner-error.log").write_text(str(e))
-                self._log(f"[red][Planner] failed:[/] {e}")
+                self._log(f"[red][Planner] failed:[/] {_safe(e)}")
                 self._log("[yellow][Planner] falling back to mock decomposer[/]")
                 self._tasks = mock_planner_decompose(self.goal or "")
                 used_mock = True
@@ -541,7 +597,7 @@ class PMAgentTUI(App):
                 (self._artifacts_dir / "planner-crash.log").write_text(
                     f"{type(e).__name__}: {e}\n\n{tb}"
                 )
-                self._log(f"[red][Planner] crashed:[/] {type(e).__name__}: {e}")
+                self._log(f"[red][Planner] crashed:[/] {type(e).__name__}: {_safe(e)}")
                 self._log(
                     f"[red][Planner] traceback saved to[/] "
                     f"{self._artifacts_dir / 'planner-crash.log'}"
@@ -565,7 +621,7 @@ class PMAgentTUI(App):
                 f"[dim]  {t.id} paths:[/] {', '.join(t.allowed_paths) or '(none)'}"
             )
             for crit in t.acceptance[:3]:
-                self._log(f"[dim]  {t.id} accept:[/] {crit}")
+                self._log(f"[dim]  {_safe(t.id)} accept:[/] {_safe(crit)}")
 
         label = "mock" if used_mock else "real claude"
         self._set_agent_status(
@@ -591,7 +647,21 @@ class PMAgentTUI(App):
             self._set_agent_status(coder_card, "running", f"{task.id}: streaming")
             self._update_task_status(task.id, "running")
 
-            full_prompt = task.prompt + CODER_COMMIT_SUFFIX.format(task_id=task.id)
+            # BUG-006: prepend the sandbox boundary (allowed paths +
+            # acceptance) so the Coder LLM has explicit context for what it
+            # may and must produce — not just the free-form prompt.
+            allowed_block = "\n".join(f"    - {p}" for p in task.allowed_paths) or "    (any)"
+            accept_block = "\n".join(f"    - {c}" for c in task.acceptance) or "    (none)"
+            constraints = CODER_CONSTRAINTS_PREFIX.format(
+                task_id=task.id,
+                allowed_paths_block=allowed_block,
+                acceptance_block=accept_block,
+            )
+            full_prompt = (
+                constraints + task.prompt
+                + CODER_COMMIT_SUFFIX.format(task_id=task.id)
+            )
+            assistant_buf = ""  # BUG-033 local batch buffer for stream
 
             # Day 11 fault injection: substitute a deterministic synthetic
             # event stream when the demo asks for timeout / api-error. The
@@ -617,11 +687,22 @@ class PMAgentTUI(App):
                     sid = (ev.get("session_id") or "")[:8]
                     self._log(f"[dim][{task.id}] session={sid}[/]")
                 elif et == "assistant":
+                    # BUG-033: batch assistant chunks instead of writing one
+                    # RichLog line per token. We flush on newline OR after
+                    # the local buffer crosses 200 chars; tail flush below.
                     for part in ev.get("message", {}).get("content", []):
                         if part.get("type") == "text":
                             text = part["text"]
                             self._streamed_text += text
-                            self._log(f"[bold cyan][{task.id}][/] {text}")
+                            assistant_buf += text
+                            while "\n" in assistant_buf or len(assistant_buf) > 200:
+                                if "\n" in assistant_buf:
+                                    chunk, assistant_buf = assistant_buf.split("\n", 1)
+                                else:
+                                    chunk, assistant_buf = assistant_buf[:200], assistant_buf[200:]
+                                self._log(
+                                    f"[bold cyan][{_safe(task.id)}][/] {_safe(chunk)}"
+                                )
                 elif et == "result":
                     cost = ev.get("total_cost_usd") or 0.0
                     dur = ev.get("duration_ms") or 0
@@ -637,8 +718,8 @@ class PMAgentTUI(App):
                         )
                         self._task_errors[task.id] = str(reason)[:300]
                         self._log(
-                            f"[red][{task.id}] ✗ API ERROR[/] "
-                            f"reason={str(reason)[:120]}"
+                            f"[red][{_safe(task.id)}] ✗ API ERROR[/] "
+                            f"reason={_safe(str(reason)[:120])}"
                         )
                         self._log(
                             f"[dim][{task.id}] cost=${float(cost):.4f} dur={dur}ms[/]"
@@ -647,6 +728,9 @@ class PMAgentTUI(App):
                         self._set_agent_status(
                             coder_card, "failed", f"{task.id}: API error"
                         )
+                        # BUG-018: progress advances on terminal API error
+                        # so the bar tracks task completion (success OR fail).
+                        self._tasks_done += 1
                     else:
                         self._log(
                             f"[green][{task.id}] ✓ result[/] "
@@ -674,12 +758,32 @@ class PMAgentTUI(App):
                 elif et == "system" and ev.get("subtype") == "timeout":
                     elapsed_s = ev.get("elapsed_s")
                     self._log(
-                        f"[red][{task.id}] ✗ TIMEOUT after {elapsed_s}s — "
+                        f"[red][{_safe(task.id)}] ✗ TIMEOUT after {elapsed_s}s — "
                         f"subprocess killed[/]"
                     )
                     self._update_task_status(task.id, "timeout")
                     self._set_agent_status(
                         coder_card, "failed", f"{task.id}: timeout"
+                    )
+                    # BUG-018: still advance progress so the bar reflects
+                    # that this task entered a terminal state, even though
+                    # it didn't succeed.
+                    self._tasks_done += 1
+                    progress.update(
+                        progress=int(100 * self._tasks_done / max(1, len(self._tasks)))
+                    )
+                elif et == "system" and ev.get("subtype") == "spawn_error":
+                    err = ev.get("error", "unknown spawn error")
+                    self._log(
+                        f"[red][{_safe(task.id)}] ✗ spawn error:[/] {_safe(err)}"
+                    )
+                    self._update_task_status(task.id, "failed")
+                    self._set_agent_status(
+                        coder_card, "failed", f"{task.id}: spawn error"
+                    )
+                    self._tasks_done += 1
+                    progress.update(
+                        progress=int(100 * self._tasks_done / max(1, len(self._tasks)))
                     )
 
                 elapsed = time.time() - self._start_time
@@ -689,6 +793,9 @@ class PMAgentTUI(App):
                     )
                 )
 
+            # Flush any trailing assistant batch (BUG-033)
+            if assistant_buf.strip():
+                self._log(f"[bold cyan][{_safe(task.id)}][/] {_safe(assistant_buf)}")
             # Capture diff BEFORE cleanup wipes the branch.
             diff = await asyncio.to_thread(self.wm.diff_against_base, task.id)
             self._task_diffs[task.id] = diff
@@ -711,20 +818,47 @@ class PMAgentTUI(App):
 
     @staticmethod
     def _diff_stats(diff: str) -> dict[str, int]:
+        """Count added / removed lines and unique files from a unified diff.
+
+        BUG-014 + BUG-045: the previous hand-rolled scanner treated ANY line
+        starting with '---' / '+++' as a file header, miscounting renames,
+        whitespace-prefixed paths, and content lines like markdown HRs.
+        We now walk only the hunk regions, gated by a strict header pattern,
+        and rely on git-style 'diff --git a/<x> b/<y>' (or '--- a/<x>' /
+        '+++ b/<y>') for file detection.
+        """
         added = 0
         removed = 0
         files: set[str] = set()
+        in_hunk = False
         for line in diff.splitlines():
-            if line.startswith("+++") or line.startswith("---"):
-                # +++ b/path  /  --- a/path  -> file marker, count later
-                if len(line) > 6:
-                    files.add(line[6:])
+            if line.startswith("diff --git "):
+                # diff --git a/<path-a> b/<path-b> — pick path-b (post-image)
+                parts = line.split(" ", 3)
+                if len(parts) >= 4:
+                    b = parts[3]
+                    if b.startswith("b/"):
+                        files.add(b[2:])
+                    else:
+                        files.add(b)
+                in_hunk = False
                 continue
+            if line.startswith("@@ "):
+                in_hunk = True
+                continue
+            if not in_hunk:
+                # Skip everything between diff headers and the first hunk
+                # (index, --- a/x, +++ b/x, mode, similarity, etc.)
+                continue
+            # Inside a hunk every line is content: leading '+'/'-'/' '/'\\'.
+            # '+++ ' and '--- ' here are content (e.g. a markdown HR or a
+            # docstring banner literally starts with three dashes); they
+            # would only be file markers OUTSIDE a hunk, but in_hunk gates
+            # that path. So count + and - prefixes uniformly.
             if line.startswith("+"):
                 added += 1
             elif line.startswith("-"):
                 removed += 1
-        files.discard("ev/null")  # /dev/null appears for new files
         return {"added": added, "removed": removed, "files": len(files)}
 
     def _write_run_summary(self) -> Path:
@@ -952,6 +1086,14 @@ class PMAgentTUI(App):
         try:
             card = self.query_one(f"#agent-{name}", Static)
         except Exception:
+            # BUG-009: surface the miss instead of swallowing silently.
+            # Previously a 3rd Coder (N>2 tasks) lost its UI feedback with
+            # zero indication. The Planner system prompt caps task count at
+            # 2, so this only fires on misuse / future changes.
+            self._log(
+                f"[yellow]agent card missing: {_safe(name)} → "
+                f"status={_safe(status)} action={_safe(action)}[/]"
+            )
             return
         card.update(self._agent_card_text(name, status, action))
         for cls in (
@@ -986,7 +1128,7 @@ class PMAgentTUI(App):
         self._integration = None
         self._session_complete = False
         self._start_time = time.time()
-        self._run_id = time.strftime("%Y%m%d-%H%M%S")
+        self._run_id = (time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4])
         self._artifacts_dir = ARTIFACTS_ROOT / self._run_id
 
         try:
@@ -1066,7 +1208,7 @@ class PMAgentTUI(App):
             self.query_one("#goal", Label).update(self._goal_text())
         except Exception:
             pass
-        self._log(f"[cyan]new goal:[/] {value}")
+        self._log(f"[cyan]new goal:[/] {_safe(value)}")
 
         self._reset_for_new_run()
         # Interactive mode always uses real Planner — no --single path here.
@@ -1095,7 +1237,7 @@ def _ensure_target_repo(path: Path) -> Path:
     path = path.expanduser().resolve()
     path.mkdir(parents=True, exist_ok=True)
     if not (path / ".git").exists():
-        subprocess.run(["git", "init", "-q"], cwd=str(path), check=True)
+        subprocess.run(["git", "init", "-q", "-b", "master"], cwd=str(path), check=True)
         # Need at least one commit so worktree branch creation works.
         (path / ".gitkeep").write_text("")
         subprocess.run(["git", "add", ".gitkeep"], cwd=str(path), check=True)
@@ -1114,8 +1256,8 @@ def main() -> None:
     ap.add_argument(
         "--repo",
         type=Path,
-        default=Path("/tmp/pm-agent-target"),
-        help="target git repo for worktrees (default: /tmp/pm-agent-target)",
+        default=Path("/tmp/pm-agent-day7-target"),
+        help="target git repo for worktrees (default: /tmp/pm-agent-day7-target, aligned with docs/demo-commands.sh)",
     )
     ap.add_argument(
         "--single",
@@ -1138,6 +1280,18 @@ def main() -> None:
         type=float,
         default=180.0,
         help="seconds before each Coder subprocess is killed (default: 180)",
+    )
+    ap.add_argument(
+        "--max-retries",
+        type=int,
+        default=2,
+        help="planner self-correcting retry budget (default: 2 = up to 3 attempts)",
+    )
+    ap.add_argument(
+        "--test-timeout",
+        type=float,
+        default=120.0,
+        help="seconds before integration test_cmd is killed (default: 120)",
     )
     ap.add_argument(
         "--inject-fault",
@@ -1178,6 +1332,8 @@ def main() -> None:
         coder_timeout=args.coder_timeout,
         inject_fault=args.inject_fault,
         interactive=args.interactive,
+        max_retries=args.max_retries,
+        test_timeout=args.test_timeout,
     ).run()
 
 
