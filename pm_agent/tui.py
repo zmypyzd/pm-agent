@@ -42,7 +42,7 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import DataTable, Label, ProgressBar, RichLog, Static
+from textual.widgets import DataTable, Input, Label, ProgressBar, RichLog, Static
 
 from pm_agent.planner import PlannerError, plan
 from pm_agent.runner import run_claude_async
@@ -189,11 +189,20 @@ class PMAgentTUI(App):
         background: $secondary 40%;
         padding: 0 1;
     }
+
+    #goal-input {
+        height: 3;
+        background: $surface;
+        border: solid $accent;
+        margin: 0 0 0 0;
+    }
     """
 
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("r", "rerun", "Re-run"),
+        ("n", "focus_input", "New goal"),
+        ("escape", "blur_input", ""),
     ]
 
     _start_time: float = 0.0
@@ -213,10 +222,16 @@ class PMAgentTUI(App):
         test_cmd: str | None = None,
         coder_timeout: float = 180.0,
         inject_fault: str | None = None,
+        interactive: bool = False,
     ) -> None:
         super().__init__()
         self.goal = goal
-        self.is_mock = goal is None
+        # Day 15: interactive mode lets the user type goals in a TUI Input
+        # widget and run them back-to-back without restarting the process.
+        # With interactive=True we are NOT in mock mode even when goal=None;
+        # we just sit and wait for the first input.
+        self.interactive = interactive
+        self.is_mock = goal is None and not interactive
         self.single = single
         self.use_real_planner = use_real_planner
         self.test_cmd = test_cmd
@@ -236,13 +251,22 @@ class PMAgentTUI(App):
         self._rate_limit_events: list[dict] = []
         self._integration: IntegrationResult | None = None
 
-    def compose(self) -> ComposeResult:
-        display_goal = self.goal if self.goal else GOAL_MOCK
-        goal_text = f"Goal: {display_goal}"
+    def _goal_text(self) -> str:
+        if self.goal:
+            display = self.goal
+        elif self.is_mock:
+            display = GOAL_MOCK
+        else:
+            # Interactive mode, waiting for first input.
+            display = "(type a goal in the input bar below and press Enter)"
+        text = f"Goal: {display}"
         if self.inject_fault:
-            goal_text += f"   [bold red on white] FAULT: {self.inject_fault} [/]"
+            text += f"   [bold red on white] FAULT: {self.inject_fault} [/]"
+        return text
+
+    def compose(self) -> ComposeResult:
         with Vertical(id="goal-bar"):
-            yield Label(goal_text, id="goal")
+            yield Label(self._goal_text(), id="goal")
             with Horizontal(id="progress-row"):
                 yield ProgressBar(total=100, show_eta=False, id="progress")
                 yield Label("0/0 tasks", id="task-count")
@@ -261,6 +285,11 @@ class PMAgentTUI(App):
             with Vertical(id="right"):
                 yield Static("Live Log", classes="panel-title")
                 yield RichLog(id="logs", wrap=True, highlight=True, markup=True)
+        if self.interactive:
+            yield Input(
+                placeholder="Type goal, Enter to run · esc to defocus · n to refocus",
+                id="goal-input",
+            )
         yield Static(self._footer_text(0.0, 0, 0.0, "events"), id="footer-bar")
 
     def on_mount(self) -> None:
@@ -283,8 +312,23 @@ class PMAgentTUI(App):
             return
 
         self._log("[green]pm-agent TUI started (real mode)[/]")
-        self._log(f"[dim]goal:[/] {self.goal}")
         self._log(f"[dim]target repo:[/] {self.repo}")
+        if self.interactive:
+            self._log(
+                "[cyan]interactive mode — type a goal in the input bar and press Enter[/]"
+            )
+
+        if self.interactive and not self.goal:
+            # Waiting state: focus the input, don't run a session yet.
+            self._session_complete = True  # so action_rerun / Enter aren't blocked
+            self._update_task_count()
+            try:
+                self.query_one("#goal-input", Input).focus()
+            except Exception:
+                pass
+            return
+
+        self._log(f"[dim]goal:[/] {self.goal}")
 
         # Note: tasks are populated AFTER planner runs (or right now if --single).
         if self.single:
@@ -917,17 +961,46 @@ class PMAgentTUI(App):
             card.remove_class(cls)
         card.add_class(f"status-{status}")
 
-    @staticmethod
-    def _footer_text(cost: float, count: int, elapsed: float, count_label: str) -> str:
+    def _footer_text(self, cost: float, count: int, elapsed: float, count_label: str) -> str:
         elapsed_str = str(timedelta(seconds=int(elapsed)))
+        hint = "q to quit · r to re-run"
+        if self.interactive:
+            hint += " · n new goal · esc defocus"
         return (
             f"cost: [bold green]${cost:.4f}[/]   "
             f"{count_label}: [bold cyan]{count:,}[/]   "
             f"elapsed: [bold]{elapsed_str}[/]   "
-            f"|   [dim]q to quit · r to re-run[/]"
+            f"|   [dim]{hint}[/]"
         )
 
     # ---------- bindings ----------
+    def _reset_for_new_run(self) -> None:
+        """Reset per-run state. Shared by action_rerun and on_input_submitted."""
+        self._tasks_done = 0
+        self._event_count = 0
+        self._cost_usd = 0.0
+        self._streamed_text = ""
+        self._task_diffs = {}
+        self._task_errors = {}
+        self._rate_limit_events = []
+        self._integration = None
+        self._session_complete = False
+        self._start_time = time.time()
+        self._run_id = time.strftime("%Y%m%d-%H%M%S")
+        self._artifacts_dir = ARTIFACTS_ROOT / self._run_id
+
+        try:
+            self.query_one("#progress", ProgressBar).update(progress=0)
+        except Exception:
+            pass
+        try:
+            self.query_one("#tasks", DataTable).clear()
+        except Exception:
+            pass
+        self._task_rows = {}
+        for name, status, action in AGENTS_INITIAL:
+            self._set_agent_status(name, status, action)
+
     def action_rerun(self) -> None:
         """Re-run the session. Mock mode resets the ticker; real mode reruns
         the planner + coders + integration. Refuses if a real-mode session is
@@ -943,7 +1016,6 @@ class PMAgentTUI(App):
                 progress.update(progress=0)
             except Exception:
                 pass
-            # Reset mock task rows back to their initial statuses.
             try:
                 table = self.query_one("#tasks", DataTable)
                 for i, (_tid, _title, status) in enumerate(TASKS_MOCK):
@@ -956,58 +1028,65 @@ class PMAgentTUI(App):
             return
 
         if not self._session_complete:
-            self._log(
-                "[yellow]↻ session still running; press q to abort first[/]"
-            )
+            self._log("[yellow]↻ session still running; press q to abort first[/]")
+            return
+
+        if not self.goal:
+            self._log("[yellow]no goal set; type one in the input bar and press Enter[/]")
             return
 
         self._log("[yellow]↻ re-running session...[/]")
-        # Per-run state reset.
-        self._tasks_done = 0
-        self._event_count = 0
-        self._cost_usd = 0.0
-        self._streamed_text = ""
-        self._task_diffs = {}
-        self._task_errors = {}
-        self._rate_limit_events = []
-        self._integration = None
-        self._session_complete = False
-        self._start_time = time.time()
-        self._run_id = time.strftime("%Y%m%d-%H%M%S")
-        self._artifacts_dir = ARTIFACTS_ROOT / self._run_id
+        self._reset_for_new_run()
 
-        try:
-            progress = self.query_one("#progress", ProgressBar)
-            progress.update(progress=0)
-        except Exception:
-            pass
-
-        # Clear task table — planner (or single-mode block below) will re-add.
-        try:
-            table = self.query_one("#tasks", DataTable)
-            table.clear()
-        except Exception:
-            table = None  # type: ignore[assignment]
-        self._task_rows = {}
-
-        # Reset agent cards to their initial states.
-        for name, status, action in AGENTS_INITIAL:
-            self._set_agent_status(name, status, action)
-
-        # In --single mode tasks are pre-populated and not re-decomposed; keep
-        # them and re-add their row.
-        if self.single and table is not None:
+        table = self.query_one("#tasks", DataTable)
+        if self.single:
             for t in self._tasks:
                 rk = table.add_row(t.id, t.title[:30], self._status_cell("ready"))
                 self._task_rows[t.id] = rk
-        elif not self.single:
-            # Real-planner mode: drop tasks so a stale list doesn't briefly
-            # show the old run's IDs while the planner thinks.
+        else:
             self._tasks = []
 
         self._update_task_count()
         # @work(exclusive=True) will cancel any lingering worker before starting.
         self._run_session()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Day 15: user typed a goal into the input bar and pressed Enter."""
+        if event.input.id != "goal-input":
+            return
+        value = event.value.strip()
+        if not value:
+            return
+        if not self._session_complete:
+            self._log("[yellow]session still running; press q to abort first[/]")
+            return
+        self.goal = value
+        event.input.value = ""
+        try:
+            self.query_one("#goal", Label).update(self._goal_text())
+        except Exception:
+            pass
+        self._log(f"[cyan]new goal:[/] {value}")
+
+        self._reset_for_new_run()
+        # Interactive mode always uses real Planner — no --single path here.
+        self._tasks = []
+        self._update_task_count()
+        self.set_focus(None)  # defocus input so q/r work without escape first
+        self._run_session()
+
+    def action_focus_input(self) -> None:
+        if not self.interactive:
+            return
+        try:
+            self.query_one("#goal-input", Input).focus()
+        except Exception:
+            pass
+
+    def action_blur_input(self) -> None:
+        if not self.interactive:
+            return
+        self.set_focus(None)
 
 
 def _ensure_target_repo(path: Path) -> Path:
@@ -1073,10 +1152,19 @@ def main() -> None:
              "is_error result. "
              "All three are free / deterministic — no extra claude tokens.",
     )
+    ap.add_argument(
+        "--interactive", "-i",
+        action="store_true",
+        help="Day 15: show an input bar at the bottom; type goals and press "
+             "Enter to run them back-to-back. Initial goal arg is optional in "
+             "this mode — omit it to start at the input prompt.",
+    )
     args = ap.parse_args()
 
     goal = " ".join(args.goal).strip() or None
-    if goal is None:
+
+    # Mock mode: no goal AND not interactive.
+    if goal is None and not args.interactive:
         PMAgentTUI(goal=None).run()
         return
 
@@ -1089,6 +1177,7 @@ def main() -> None:
         test_cmd=args.test_cmd,
         coder_timeout=args.coder_timeout,
         inject_fault=args.inject_fault,
+        interactive=args.interactive,
     ).run()
 
 

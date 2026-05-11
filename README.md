@@ -18,6 +18,9 @@ uv sync
 # Mock TUI — visual only, free
 uv run python -m pm_agent.tui
 
+# Interactive TUI — type goals in the input bar, run back-to-back
+uv run python -m pm_agent.tui --interactive --repo /tmp/pm-agent-day7-target
+
 # Single Coder real run
 uv run python -m pm_agent.tui --single "say only the word four"
 

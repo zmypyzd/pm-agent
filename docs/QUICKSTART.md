@@ -30,6 +30,26 @@ uv run python -m pm_agent.tui
 卡片、Live Log、底部 footer。**按 `q` 退出**。这一步用 mock 数据，没花任何
 API 钱。
 
+### 想 TUI 里直接输入目标连续跑？
+
+```bash
+uv run python -m pm_agent.tui --interactive --repo /tmp/pm-agent-day7-target
+```
+
+底部多一个输入框。键位：
+
+| 键 | 行为 |
+|---|---|
+| 输入 + Enter | 跑这个目标 |
+| `n` | 把光标放回输入框 |
+| `esc` | 输入框失焦（之后 `q`/`r` 可用） |
+| `q` | 退出 |
+| `r` | 用同一目标重跑 |
+
+跑完一个目标，输入框还在，敲下一个 Enter 继续。`--repo` / `--test-cmd` 一次设定，session 内 sticky。
+
+证据：`docs/tui-day15-interactive-waiting-snapshot.svg` / `docs/tui-day15-interactive-typed-snapshot.svg`
+
 ## 3 · 跑一个真实任务（约 1 分钟，~$0.35）
 
 准备一个 demo target repo（一次性，已脚本化）：
