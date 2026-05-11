@@ -161,6 +161,17 @@ def build_coder_tasks(
     """First call (prior_diff=None) returns (t1=code, t2=test-with-no-diff-yet).
     After Coder-1 commits, call again with prior_diff to get t2 with the diff
     embedded in its prompt — Coder-2 sees the fix before writing the test."""
+
+# Internal helpers (loop.py-private; not part of public contract but documented
+# so spec consumers know the wiring)
+def run_gates(repo: Path) -> tuple[bool, str]:
+    """Run pytest tests/test_repros.py + mypy pm_agent/ + ruff check pm_agent/.
+    Returns (all_green, output_for_pr_body). output is the concatenated tail
+    of any failed tool's stdout/stderr — empty string when all_green=True."""
+
+def run_pytest(repo: Path) -> tuple[bool, str]: ...   # internal helper for run_gates
+def run_mypy(repo: Path) -> tuple[bool, str]: ...
+def run_ruff(repo: Path) -> tuple[bool, str]: ...
 ```
 
 ### `pm_agent/persistence.py`
@@ -207,11 +218,14 @@ CREATE TABLE findings (
     cycle_id INTEGER NOT NULL REFERENCES cycles(id),
     bug_id TEXT NOT NULL,
     title TEXT NOT NULL,
-    severity TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK(severity IN ('Critical','High','Medium','Low')),
     paths_json TEXT NOT NULL,
     acceptance_json TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    status TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('bug','tech-debt')),
+    status TEXT NOT NULL CHECK(status IN (
+        'discovered','fixing-code','fixing-test','integrating','testing',
+        'routing','done','failed','skipped','interrupted'
+    )),
     UNIQUE(cycle_id, bug_id)
 );
 CREATE INDEX idx_findings_bug_id ON findings(bug_id);
@@ -307,12 +321,12 @@ def trend_24h() -> TrendResponse: ...         # HTMX 30s polling
 pm-agent loop run
        │
        ▼
-┌─────────────────────────┐
-│ startup                 │
-│  - persistence.init_db()│   PRAGMA WAL
-│  - persistence.reconcile│   clean zombie cycle/finding/worktree
-│  - WorktreeManager(repo)│   acquire flock
-└──────────┬──────────────┘
+┌─────────────────────────────┐
+│ startup                     │
+│  - persistence.init_db(path)│   PRAGMA WAL
+│  - persistence.reconcile(repo)│ clean zombie cycle/finding/worktree
+│  - WorktreeManager(repo)    │   acquire flock
+└──────────┬──────────────────┘
            ▼
        ┌──────┐
    ┌──►│ idle │  sleep cfg.interval_s
@@ -332,63 +346,69 @@ pm-agent loop run
 ### `run_one_cycle()` flow
 
 ```
-1. github.sync_pr_states()         ← pick up external merges/closes
-2. findings, scan_cost = scanner.scan(repo)
+1. check stop_event; if set, finish_cycle('done', partial) and return
+2. github.sync_pr_states()         ← pick up external merges/closes
+3. check stop_event
+4. findings, scan_cost = scanner.scan(repo)
    persistence.record_cost(cycle_id, "scanner", scan_cost)
 
-3. for finding in findings:
+5. for finding in findings:
+       if stop_event.is_set(): break    ← per-finding stop check
+
        persistence.record_finding(cycle_id, finding)
+       t1 = None; t2 = None    ← declared in outer scope for finally
+       try:
+           # Gate (a): 3-cycle skip — uses finding.bug_id (paths+kind hash)
+           if persistence.fix_attempts(finding.bug_id) >= 3:
+               update_finding(status="skipped"); alert; continue
 
-       # Gate (a): 3-cycle skip — uses finding.bug_id (paths+kind hash)
-       if persistence.fix_attempts(finding.bug_id) >= 3:
-           update_finding(status="skipped"); alert; continue
+           # Gate (b): meta blocklist — fnmatch
+           if any(fnmatch(p, pat) for p in finding.paths for pat in cfg.blocklist):
+               update_finding(status="skipped"); alert; continue
 
-       # Gate (b): meta blocklist — fnmatch
-       if any(fnmatch(p, pat) for p in finding.paths for pat in cfg.blocklist):
-           update_finding(status="skipped"); alert; continue
+           # Build CoderTasks. Coder-1 first (code fix), Coder-2 second (with diff).
+           t1, _ = build_coder_tasks(finding, prior_diff=None)
+           wm.create(t1.id)
+           run Coder-1 → if fail: update_finding("failed"); continue
+           diff_1 = wm.diff_against_base(t1.id)
+           if not diff_1.strip():
+               # Coder-1 produced NO_CHANGES — nothing for Coder-2 to test against.
+               update_finding("failed"); continue
 
-       # Build CoderTasks. Coder-1 first (code fix), Coder-2 second (with diff).
-       t1, _ = build_coder_tasks(finding, prior_diff=None)
-       wm.create(t1.id)
-       run Coder-1 → if fail: update_finding("failed"); continue
-       diff_1 = wm.diff_against_base(t1.id)
-       wm.cleanup_worktree(t1.id)
-       if not diff_1.strip():
-           # Coder-1 produced NO_CHANGES — nothing for Coder-2 to test against.
-           # Don't proceed to Coder-2 with an empty fix; mark finding failed early.
-           update_finding("failed"); wm.delete_branch(t1.id); continue
+           _, t2 = build_coder_tasks(finding, prior_diff=diff_1)
+           wm.create(t2.id)
+           run Coder-2 → if fail: update_finding("failed"); continue
+           ig = wm.integrate(cycle_id, [t1.id, t2.id])
+           if ig.conflicts:
+               update_finding("failed"); continue
 
-       _, t2 = build_coder_tasks(finding, prior_diff=diff_1)
-       wm.create(t2.id)
-       run Coder-2 → if fail: update_finding("failed"); wm.delete_branch(t1); continue
-       wm.cleanup_worktree(t2.id)
+           # Gate (c): auto-merge requires pytest + mypy + ruff
+           gates_green, gate_output = run_gates(repo)
+               # gates_green: bool; gate_output: str (failed sections joined for PR body)
 
-       ig = wm.integrate(cycle_id, [t1.id, t2.id])
-       if ig.conflicts:
-           update_finding("failed"); wm.delete_branch(t1); wm.delete_branch(t2); continue
+           if finding.severity in {"Critical", "High"}:
+               pr = github.open_pr(branch=t1.id, finding=finding,
+                                   body_extras=gate_output if not gates_green else "")
+           elif gates_green:
+               pr = github.auto_merge(branch=t1.id, finding=finding)
+           else:
+               # Low/Medium severity but gates red → open PR for human review,
+               # body includes failed gate output so reviewer sees why
+               pr = github.open_pr(branch=t1.id, finding=finding, body_extras=gate_output)
 
-       # Gate (c): auto-merge requires pytest + mypy + ruff
-       gates_green = run_pytest(repo) and run_mypy(repo) and run_ruff(repo)
+           persistence.record_pr(finding.id, pr.number, pr.url, pr.action)
+           update_finding("done")
+       finally:
+           # Uniform cleanup — runs on every path (success, fail, skip, exception).
+           # Long-running daemon must never leak worktrees/branches.
+           if t1 is not None:
+               wm.cleanup_worktree(t1.id)
+               wm.delete_branch(t1.id)
+           if t2 is not None:
+               wm.cleanup_worktree(t2.id)
+               wm.delete_branch(t2.id)
 
-       if finding.severity in {"Critical", "High"}:
-           pr = github.open_pr(branch=t1.id, finding=finding,
-                               body_extras=fail_output_if_any(gates_green))
-       elif gates_green:
-           pr = github.auto_merge(branch=t1.id, finding=finding)
-       else:
-           # Low/Medium severity but gates red → open PR for human review,
-           # body includes failed gate output so reviewer sees why
-           pr = github.open_pr(branch=t1.id, finding=finding,
-                               body_extras=fail_output(pytest=..., mypy=..., ruff=...))
-
-       persistence.record_pr(finding.id, pr.number, pr.url, pr.action)
-       update_finding("done")
-
-       # Clean branches regardless of outcome — keeps long-running daemon tidy
-       wm.delete_branch(t1.id)
-       wm.delete_branch(t2.id)
-
-4. return CycleResult(...)
+6. return CycleResult(...)
 ```
 
 ### Finding state machine
@@ -572,6 +592,10 @@ tests/
 | dashboard | / renders non-empty | TestClient + seeded cycle → 200 + "Live Cycle" |
 | dashboard | /api/live idle state | TestClient empty db → 200 {cycle:null, status:idle} not 404 |
 | dashboard | /api/trend perf | seed 1000 rows → response < 100ms |
+| **daemon** | **startup w/ empty db** | run_forever's startup runs reconcile+init on fresh ~/.pm-agent/ → no error |
+| **daemon** | **SIGTERM grace** | set stop_event mid-cycle → cycle finishes within 1-finding window |
+| **daemon** | **scanner crash survives** | scanner shim raises mid-scan → cycle.status='errored', daemon continues to next interval |
+| **daemon** | **gh auth halt** | gh_shim auth_failure=True → daemon halts cleanly, dashboard red banner |
 
 ### 6.4 Coverage targets
 
@@ -783,6 +807,7 @@ scanner hits 0 bugs.
 | D12 | Dashboard top "Live Cycle" panel | §3, §7 |
 | §2 contract revisions: (1) scan returns (list, cost); (2) on_retry hook; (3) bug_id includes kind; (4) init_db returns None + @transaction; (5) PRResult.action; (6) Pydantic dashboard responses; (7) blocklist fnmatch semantics | §3 |
 | Section 3 deltas: (8) build_coder_tasks(prior_diff=); (9) interrupted counts fix_attempts; (10) Coder-2 fail → whole finding fail; (11) wm.delete_branch after each finding; (12) cycle.status enum; (13) sync_pr_states rename; (14) gates-red PR body includes failed output | §4 |
+| spec-eng-review (round 2 — full spec re-review): (F1) findings.status + severity + kind CHECK constraints; (F2) reconcile(repo) single-arg; (F3) stop_event checked at sync_pr_states + scanner + per-finding; (F4) try/finally around finding body for uniform cleanup; (F5) run_gates/pytest/mypy/ruff internal helpers documented; (F6) +4 daemon lifecycle smoke tests | §3, §4, §6 |
 
 ---
 
@@ -792,3 +817,18 @@ scanner hits 0 bugs.
 - Dashboard CSS / layout details (deferred to UI implementation)
 - gh_shim API surface specifics (build-phase decision)
 - Test seed data generators (covered partially in §6.3)
+
+---
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | not run; brainstorm covered scope |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 2 | CLEAR (PLAN) | round 1: 12 D-decisions on Section 1; round 2: 5 new issues on full spec (CHECK constraints, reconcile signature, stop_event scope, try/finally cleanup, daemon smoke ×4) |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | dashboard layout deferred to UI impl |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | internal API; DX review low ROI |
+| Outside Voice | subagent challenge | independent 2nd opinion | 3 | informational | Section 1 design + Section 2 API contracts + integrated spec all challenged via Claude subagent; no codex run (budget) |
+
+- **UNRESOLVED:** 0 decisions
+- **VERDICT:** ENG CLEARED — ready to invoke `superpowers:writing-plans` for implementation plan.
