@@ -4,6 +4,8 @@ A multi-agent orchestrator that drives `claude -p` subprocesses toward a user-de
 
 **Status**: demo-ready (Day 14 of 14). 3/3 zero-incident dry-runs on the canonical `/health` goal (~50s wall, ~$0.35 each).
 
+**New here? → [`docs/QUICKSTART.md`](docs/QUICKSTART.md)** — 5-minute hands-on guide.
+
 **Stack**: Python 3.11 + Textual + git worktree + Claude Code CLI (`claude -p`).
 
 **Roles**: Planner / Coder (parallel) / Integration.
