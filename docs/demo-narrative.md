@@ -146,10 +146,17 @@ short — beats 1-6 + 8-9 still tell the story.
 
 ## Dry-run sequence (Day 14)
 
-至少 3 次完整 demo flow 零事故才能上场。每次记录：
+3/3 zero-incident on 2026-05-11 — goal: `/health` endpoint + test, full real
+Planner + 2 Coders + integration test. Repro: `bash docs/demo-commands.sh full_e2e_dry_run`.
 
-| Run # | 日期 | 卡点（如有） | 总时长 | 总 cost |
-|:-:|---|---|---|---|
-| 1 | _ | _ | _ | _ |
-| 2 | _ | _ | _ | _ |
-| 3 | _ | _ | _ | _ |
+| Run # | 日期 | complete | wall | cost | tasks | conflicts | tests | run_id |
+|:-:|---|:-:|--:|--:|:-:|:-:|:-:|---|
+| 1 | 2026-05-11 | ✅ | 50.1s | $0.3768 | 2/2 | 0 | ✅ PASS | 20260511-180549 |
+| 2 | 2026-05-11 | ✅ | 50.1s | $0.3465 | 2/2 | 0 | ✅ PASS | 20260511-180639 |
+| 3 | 2026-05-11 | ✅ | 46.1s | $0.3127 | 2/2 | 0 | ✅ PASS | 20260511-180729 |
+
+Total cost: $1.0360 (under $1.20 budget). Wall consistently ~50s — meaningfully
+faster than the /stats run's 102s (simpler goal + 2nd-call cache warmth).
+
+If a Run 4+ becomes necessary (e.g. post-fix regression check), append a row
+above and keep this section monotonic.
