@@ -1,10 +1,18 @@
 [project]
 name = "pm-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "Multi-agent orchestrator that drives claude -p subprocesses toward a goal."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "pyyaml>=6.0.3",
     "textual>=8.2.5",
+]
+
+[project.scripts]
+pm-agent = "pm_agent.tui:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
 ]

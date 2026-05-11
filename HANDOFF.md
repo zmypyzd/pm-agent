@@ -9,8 +9,7 @@ demo 维护**，看 §0 即可，下面的 §1-14 是历史。如果是要继续
 
 ### §0 — 当前真实状态
 
-- **last commit**: 见 `git log --oneline | head -1`（截至此文档更新时是 `4268a36
-  docs: Day 14 dry-run — 3/3 zero-incident`）。
+- **last commit**: 见 `git log --oneline | head -1`（不固定 hash，文档跟随代码漂移）。
 - **14 天进度全 ✅**:
   - Day 1-9: orchestrator 核心 + robustness（runner + TUI + worktree + Planner +
     integration + timeout + retry + API failure handling）
