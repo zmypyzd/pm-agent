@@ -116,31 +116,54 @@ markdown inside string values.
 
 def build_repo_context(repo: Path, max_files: int = 60) -> str:
     try:
+        # -z null-delimits filenames so newline-injected paths can't break
+        # the LLM context boundary; we still drop anything with control chars
+        # before joining to be doubly safe (BUG-026).
         out = subprocess.run(
-            ["git", "ls-files"],
+            ["git", "ls-files", "-z"],
             cwd=str(repo),
             capture_output=True,
-            text=True,
+            text=False,
             check=True,
-        ).stdout.strip()
+        ).stdout
     except subprocess.CalledProcessError:
         return "(no tracked files — fresh repo)"
-    files = out.splitlines()[:max_files]
-    return "\n".join(files) if files else "(empty repo)"
+    raw = [b.decode("utf-8", errors="replace") for b in out.split(b"\x00") if b]
+
+    def _safe(name: str) -> bool:
+        return all(0x20 <= ord(c) < 0x7f or ord(c) >= 0x80 for c in name)
+
+    files = [f for f in raw if _safe(f)][:max_files]
+    if not files:
+        return "(empty repo)"
+    return "<FILES>\n" + "\n".join(files) + "\n</FILES>"
 
 
 def extract_yaml(text: str) -> str:
-    """Pull YAML out of a fenced block; tolerate naked YAML as a fallback."""
-    m = re.search(r"```ya?ml\s*\n(.*?)\n```", text, re.DOTALL)
+    """Pull YAML out of a fenced block; tolerate naked YAML as a fallback.
+
+    Closing-fence newline is optional (BUG-013): some LLM outputs forget it.
+    """
+    m = re.search(r"```ya?ml\s*\n(.+?)\n?```", text, re.DOTALL)
     if m:
         return m.group(1)
-    m = re.search(r"```\s*\n(.*?)\n```", text, re.DOTALL)
+    m = re.search(r"```\s*\n(.+?)\n?```", text, re.DOTALL)
     if m:
         return m.group(1)
     return text.strip()
 
 
+MAX_YAML_BYTES = 256_000
+
+
 def parse_tasks(yaml_text: str) -> list[CoderTask]:
+    # Size guard before parsing (BUG-012). 256 KB is comfortably larger than
+    # any well-formed planner output (~2 KB typical) and protects against
+    # accidental log/payload pasting.
+    if len(yaml_text) > MAX_YAML_BYTES:
+        raise PlannerError(
+            f"yaml payload too large ({len(yaml_text)} > {MAX_YAML_BYTES} bytes)"
+        )
     try:
         data = yaml.safe_load(yaml_text)
     except yaml.YAMLError:
@@ -162,36 +185,83 @@ def parse_tasks(yaml_text: str) -> list[CoderTask]:
     for i, t in enumerate(raw):
         if not isinstance(t, dict):
             raise PlannerError(f"task #{i} is not a mapping")
-        try:
-            out.append(
-                CoderTask(
-                    id=str(t["id"]),
-                    title=str(t["title"]),
-                    prompt=str(t["prompt"]),
-                    allowed_paths=list(t.get("allowed_paths") or []),
-                    acceptance=list(t.get("acceptance") or []),
+        # Strict type/non-empty checks (BUG-004 / 011 / 027). Bare str()
+        # coercion silently turned id=None into the literal "None".
+        for field_name in ("id", "title", "prompt"):
+            if field_name not in t:
+                raise PlannerError(f"task #{i} missing required field {field_name!r}")
+            v = t[field_name]
+            if not isinstance(v, str):
+                raise PlannerError(
+                    f"task #{i} field {field_name!r} must be a string, got {type(v).__name__}"
                 )
+            if not v.strip():
+                raise PlannerError(f"task #{i} field {field_name!r} is empty")
+        out.append(
+            CoderTask(
+                id=t["id"],
+                title=t["title"],
+                prompt=t["prompt"],
+                allowed_paths=list(t.get("allowed_paths") or []),
+                acceptance=list(t.get("acceptance") or []),
             )
-        except KeyError as e:
-            raise PlannerError(f"task #{i} missing required field {e}") from e
+        )
+    # Reject duplicate task IDs (BUG-047): two tasks with the same id would
+    # collide on the worktree branch ai/<id> at runtime.
+    ids = [t.id for t in out]
+    if len(set(ids)) < len(ids):
+        dup = sorted({i for i in ids if ids.count(i) > 1})
+        raise PlannerError(f"duplicate task id(s): {dup}")
     return out
 
 
+def _path_overlaps(a: str, b: str) -> bool:
+    """True if paths a and b plausibly cover overlapping files.
+
+    Covers (BUG-005):
+      - exact match
+      - prefix containment after stripping trailing ``**`` / ``*`` / ``/``
+      - fnmatch in either direction (e.g. ``src/**`` matches ``src/foo``).
+    """
+    from fnmatch import fnmatch
+
+    if a == b:
+        return True
+
+    def _root(p: str) -> str:
+        return p.rstrip("/").removesuffix("/**").removesuffix("/*").rstrip("/")
+
+    ra, rb = _root(a), _root(b)
+    if ra and rb and (ra == rb or ra.startswith(rb + "/") or rb.startswith(ra + "/")):
+        return True
+    return fnmatch(a, b) or fnmatch(b, a)
+
+
 def validate_disjoint(tasks: list[CoderTask]) -> None:
-    """Reject overlapping allowed_paths across tasks (exact match)."""
-    claimed: dict[str, str] = {}
+    """Reject overlapping allowed_paths across tasks, glob-aware (BUG-005).
+
+    Also rejects empty-string entries (BUG-028) and missing allowed_paths /
+    acceptance on any task.
+    """
     for t in tasks:
         if not t.allowed_paths:
             raise PlannerError(f"{t.id} has no allowed_paths")
         if not t.acceptance:
             raise PlannerError(f"{t.id} has no acceptance criteria")
-        for path in t.allowed_paths:
-            if path in claimed and claimed[path] != t.id:
-                raise PlannerError(
-                    f"path conflict: {path!r} claimed by both "
-                    f"{claimed[path]!r} and {t.id!r}"
-                )
-            claimed[path] = t.id
+        for p in t.allowed_paths:
+            if not isinstance(p, str) or not p.strip():
+                raise PlannerError(f"{t.id} has empty/invalid allowed_path: {p!r}")
+
+    # Cross-task glob-aware overlap check.
+    for i, ti in enumerate(tasks):
+        for tj in tasks[i + 1:]:
+            for pi in ti.allowed_paths:
+                for pj in tj.allowed_paths:
+                    if _path_overlaps(pi, pj):
+                        raise PlannerError(
+                            f"path conflict: {pi!r} ({ti.id}) overlaps "
+                            f"{pj!r} ({tj.id})"
+                        )
 
 
 async def _call_planner_once(
@@ -204,6 +274,7 @@ async def _call_planner_once(
         user_prompt = PLANNER_RETRY_PREFIX.format(error=retry_feedback) + user_prompt
     chunks: list[str] = []
     cost: float = 0.0
+    api_error_reason: str | None = None
     async for ev in run_claude_async(
         prompt=user_prompt,
         role=PLANNER_SYSTEM,
@@ -217,6 +288,17 @@ async def _call_planner_once(
                     chunks.append(part["text"])
         elif et == "result":
             cost = float(ev.get("total_cost_usd") or 0.0)
+            # BUG-029: an API-side failure produces a result event with
+            # is_error=True and (usually) no assistant chunks. Surface it
+            # immediately so the retry loop can decide whether to retry
+            # the SAME error or fall back to mock, instead of treating it
+            # as "empty response" and burning more API budget.
+            if ev.get("is_error"):
+                api_error_reason = str(
+                    ev.get("result") or ev.get("api_error_status") or "api error"
+                )
+    if api_error_reason is not None and not chunks:
+        raise PlannerError(f"planner API error: {api_error_reason}")
     return "".join(chunks), cost
 
 
