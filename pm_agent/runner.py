@@ -76,19 +76,39 @@ async def run_claude_async(
 
     Caller drives consumption rate. Errors during parse are swallowed so
     a malformed line doesn't kill the stream.
+
+    Implementation notes:
+    - stderr is sent to DEVNULL, not PIPE (BUG-001 / 049). Buffering claude's
+      verbose stderr in a PIPE that nobody reads deadlocks the child as
+      soon as it writes >64 KB.
+    - Cancellation (TUI worker.cancel() / SIGINT) is honoured by terminating
+      the child in the finally block (BUG-010). Without that, the child
+      keeps running and burning tokens after the user quit.
+    - OSError on spawn (e.g. claude not on PATH, ARG_MAX overrun) is
+      converted to a synthetic system event so callers don't see the
+      raw exception (BUG-032).
     """
     cmd = _build_cmd(prompt, role, isolate, unrestricted)
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=cwd,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            cwd=cwd,
+        )
+    except (FileNotFoundError, OSError) as e:
+        yield {
+            "type": "system",
+            "subtype": "spawn_error",
+            "error": f"{type(e).__name__}: {e}",
+        }
+        return
     assert proc.stdout is not None
 
     loop = asyncio.get_event_loop()
     deadline = None if timeout is None else loop.time() + timeout
     timed_out = False
+    cancelled = False
 
     try:
         while True:
@@ -115,18 +135,27 @@ async def run_claude_async(
                 yield json.loads(line)
             except json.JSONDecodeError:
                 continue
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     finally:
-        if timed_out and proc.returncode is None:
-            proc.terminate()
+        # Always actively kill the child if it's still running — covers
+        # timeout, normal break, AND cancellation paths uniformly.
+        if proc.returncode is None:
             try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-        elif proc.returncode is None:
-            await proc.wait()
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pass  # zombie — let the OS reap it
+            except ProcessLookupError:
+                pass
 
-    if timed_out:
+    if timed_out and not cancelled:
         yield {
             "type": "system",
             "subtype": "timeout",
@@ -141,10 +170,15 @@ def run_claude(
     isolate: bool = True,
     unrestricted: bool = False,
 ) -> RunResult:
-    """Sync runner. Streams events to stdout/stderr and returns a summary."""
+    """Sync runner. Streams events to stdout/stderr and returns a summary.
+
+    stderr is DEVNULL'd for the same reason as the async path (BUG-001 / 049):
+    an un-drained stderr PIPE deadlocks claude as soon as it logs >64 KB.
+    """
     cmd = _build_cmd(prompt, role, isolate, unrestricted)
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, bufsize=1,
     )
     assert proc.stdout is not None
 
