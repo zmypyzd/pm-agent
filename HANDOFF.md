@@ -1,6 +1,46 @@
 # HANDOFF — pm-agent
 
-新 Claude Code 会话从这里开始。读完这一份文档你就能无损接上 Day 10。
+新 Claude Code 会话从这里开始。
+
+## STATUS (2026-05-11): COMPLETE
+
+14-day plan delivered. Project is recording-ready. **如果新会话是答辩当天起手或
+demo 维护**，看 §0 即可，下面的 §1-14 是历史。如果是要继续加功能，跳到 §15。
+
+### §0 — 当前真实状态
+
+- **last commit**: 见 `git log --oneline | head -1`（截至此文档更新时是 `4268a36
+  docs: Day 14 dry-run — 3/3 zero-incident`）。
+- **14 天进度全 ✅**:
+  - Day 1-9: orchestrator 核心 + robustness（runner + TUI + worktree + Planner +
+    integration + timeout + retry + API failure handling）
+  - Day 10: TUI polish（counter / icons / 时间戳 / 颜色 / r=rerun）— `c230a09`
+  - Day 11: inject-fault 三模式 + `/stats` 二号正向 demo — `dd35b5f`, `cbf7936`
+  - Day 12: `docs/demo-narrative.md`（9 beat 录屏剧本 + 10 QA cheat-sheet）— `68f8f44`
+  - Day 13: `docs/demo-commands.sh`（18 个 copy-paste 录屏入口）— `e85d6ed`
+  - Day 14: 3/3 zero-incident dry-run，total $1.04（<预算 $1.20）— `4268a36`
+- **demo materials**: 12 张 SVG 在 `docs/`，剧本 `docs/demo-narrative.md`，
+  cheat-sheet `docs/demo-commands.sh`，run artifacts `~/.pm-agent/runs/`
+- **未做（user 主动决定）**: Reviewer agent / multi-Coder 3+ / 书面 demo deck
+  （都是 nice-to-have，不是评估要求）
+
+### §0.5 — 答辩当天 / 录屏当天的起手式
+
+```bash
+cd /Users/zmy/intership/5/agenter/pm-agent
+bash docs/demo-commands.sh prewarm_claude    # 一次，避免第一次 call 慢
+# 另一屏打开 docs/demo-narrative.md，按 Beat 1→9 念剧本
+# 每个 Beat 的 "Show" 命令 → bash docs/demo-commands.sh <beat_func>
+# 撞 rate limit → bash docs/demo-commands.sh contingency_live
+```
+
+录屏当天关心的 known limit + 一句话答辩：见 `docs/demo-narrative.md` § "Known limits"。
+
+---
+
+## (以下为历史 — 项目 Day 9 状态的快照，保留作过程证据)
+
+读完这一份文档你就能无损接上 Day 10。
 
 ## TL;DR
 
@@ -290,9 +330,36 @@ ls -t ~/.pm-agent/runs | head -1 | xargs -I {} cat ~/.pm-agent/runs/{}/summary.m
 
 ---
 
-## 14. 一句话给新 Claude
+## 14. 一句话给新 Claude（原 Day 9 → Day 10 接力）
 
 读完这份 HANDOFF 你就有上下文了。从 Day 10 §8 开始，1→2→3→4→5 顺序做完，
 1-2 个 commit 收尾。中间不要重新讨论方向 / 不要写新 PRD / 不要建议 refactor。
 有真问题（command 不通、API 错误等）就报，没就直接干。结束按惯例给一个紧凑
 status table，标 STATUS: DONE。
+
+---
+
+## 15. 如果要继续加功能（post-Day-14）
+
+项目评估要求已经满足，下面是 zmy 当时主动跳过的 nice-to-have，按性价比排序：
+
+1. **Reviewer agent** — integration 后跑 contract-drift 检查。最高 demo 价值，因为
+   把 known limit §7 直接变成 known fixed。预估 2-3 小时 + ~$0.5 测试。
+2. **Multi-Coder 3+** — 改 Planner system prompt 解锁 3 task 拆分；演示 scalability。
+   Planner prompt 改动有回归风险，要重跑 dry-run。
+3. **Shared contract field in Planner output** — Reviewer agent 的轻量替代品，让
+   Planner 输出多一个 `shared_contract: {...}` 块，两个 Coder prompt 都注入这段。
+4. **Push to remote + auto-open PR** — 把 ai/integration/<run_id> push 到 GitHub
+   并 `gh pr create`。productionization 第一步。
+5. **跨 session run 持久化** — 把 `~/.pm-agent/runs/` 抽成 SQLite + Web UI 浏览历史
+   run。脱离单次 demo 模式。
+
+**如果你加任何一个，绝对要做的：**
+
+- 跑 `bash docs/demo-commands.sh full_e2e_dry_run` 至少 1 次，确认没破录屏 path
+- 跑 `--inject-fault planner-yaml` / `coder-timeout` / `api-error` 三次，确认 fault path
+  没破。这三个是 demo contingency，**不能坏**。
+- 更新 `docs/demo-narrative.md` 加新 beat（如果新功能要进 demo）
+- 在 `docs/demo-commands.sh` 加对应的 beatN_<what> 函数
+- 不要改 `pm_agent/tui.py` 的 `_session_complete` / `_cost_usd` / `_tasks_done` /
+  `_run_id` 这几个属性名 — pilot 脚本和 narrative 都引用了它们的现有名字

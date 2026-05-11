@@ -1,86 +1,77 @@
 # pm-agent
 
-A multi-agent orchestrator that drives Claude Code subprocesses toward a user-defined goal, with a live TUI dashboard showing each agent's state.
+A multi-agent orchestrator that drives `claude -p` subprocesses toward a user-defined goal, with a live Textual TUI dashboard. Planner decomposes the goal into a file-disjoint task DAG; Coders run in parallel git worktrees; integration merges + tests the result.
 
-**Status**: day 1 skeleton.
-
-**Deadline**: 2 weeks.
+**Status**: demo-ready (Day 14 of 14). 3/3 zero-incident dry-runs on the canonical `/health` goal (~50s wall, ~$0.35 each).
 
 **Stack**: Python 3.11 + Textual + git worktree + Claude Code CLI (`claude -p`).
 
-**Roles**: Planner / Coder (parallel) / Reviewer.
-
-**Design doc**: `~/.gstack/projects/agenter/zmy-no-git-design-20260509-110211.md`
-
-**Source PRD** (deprecated, scope reduced): `../multi_agent_product_orchestrator_prd.md`
+**Roles**: Planner / Coder (parallel) / Integration.
 
 ## Quickstart
 
 ```bash
 uv sync
 
-# CLI subprocess runner (day 1)
-uv run python -m pm_agent.runner "what is 2+2"
-uv run python -m pm_agent.runner "review this code" --role "You are a senior code reviewer."
-
-# TUI mock mode (day 2 — fake data, q to quit)
+# Mock TUI — visual only, free
 uv run python -m pm_agent.tui
 
-# TUI single-coder real mode (day 3-4)
+# Single Coder real run
 uv run python -m pm_agent.tui --single "say only the word four"
 
-# TUI multi-coder + real Planner (day 6 — Planner LLM call decomposes goal into YAML)
-uv run python -m pm_agent.tui "Add JSONL logger for each claude call"
+# Full e2e (real Planner + 2 Coders + integration test)
+bash docs/demo-commands.sh full_e2e_dry_run
 
-# Skip the real Planner for cheap iteration:
-uv run python -m pm_agent.tui "demo" --mock-planner
+# Three deterministic fault modes (no real LLM Coder calls)
+uv run python -m pm_agent.tui --repo /tmp/pm-agent-day7-target \
+    --inject-fault planner-yaml "add /version endpoint"
+# also: --inject-fault coder-timeout | --inject-fault api-error
+```
 
-# Day-7 end-to-end demo: prepares a target repo and runs full Planner -> 2 Coders -> diff
-mkdir -p /tmp/pm-agent-day7-target && cd /tmp/pm-agent-day7-target
-git init -q && echo init > README.md && git add . && git commit -q -m init
-# (or copy the seed server.py + tests/test_server.py used in the day-7 verification)
-cd -
-uv run python -m pm_agent.tui --repo /tmp/pm-agent-day7-target "Add /health endpoint to handle_request returning {status: ok} as a dict, plus a test"
+After a run:
 
-# Day-8: also auto-merge into ai/integration/<run-id> and run tests on the merged tree
-uv run python -m pm_agent.tui \
-  --repo /tmp/pm-agent-day7-target \
-  --test-cmd "python3 -c 'import tests.test_server as t; [getattr(t,n)() for n in dir(t) if n.startswith(\"test_\")]; print(\"PASS\")'" \
-  "Add /version endpoint returning v1 plus a test"
-
-# After the run completes:
-ls ~/.pm-agent/runs/                                # one dir per run
-cat ~/.pm-agent/runs/<latest>/summary.md            # PR-style report
-cat ~/.pm-agent/runs/<latest>/integration.diff      # the merged proposal
+```bash
+ls ~/.pm-agent/runs/                                 # one dir per run
+cat ~/.pm-agent/runs/<latest>/summary.md             # PR-style report
 git -C /tmp/pm-agent-day7-target apply ~/.pm-agent/runs/<latest>/integration.diff
 ```
 
-Snapshots:
-- `docs/tui-day2-snapshot.svg` — mock layout
-- `docs/tui-day3-real-snapshot.svg` — single-coder, 4 events, $0.057
-- `docs/tui-day5-multi-snapshot.svg` — 2 parallel coders (mock plan), 8 events, $0.112
-- `docs/tui-day6-planner-snapshot.svg` — real Planner emits 2 file-disjoint YAML tasks
-- `docs/tui-day7-e2e-snapshot.svg` — full run: real Planner + 2 unrestricted Coders editing real code, diffs captured to artifacts dir
+## Architecture
 
-Architecture:
-- `pm_agent/tasks.py` — shared `CoderTask` schema (id / title / prompt / allowed_paths / acceptance)
-- `pm_agent/runner.py` — `run_claude_async(prompt, role, isolate, cwd, unrestricted)` async event stream; `unrestricted=True` adds `--dangerously-skip-permissions` for Coders that need to Edit/Write/Bash
-- `pm_agent/worktree.py` — `WorktreeManager.{create,cleanup,acreate,acleanup,diff_against_base}`; auto-detects base branch (master/main)
-- `pm_agent/planner.py` — `plan(goal, repo)` calls claude with strict YAML system prompt; parser tolerates fenced/naked YAML, strips backticks defensively, rejects `{}`/`[]` literals via prompt rule
-- `pm_agent/tui.py` — Textual app. Planner runs first (with mock fallback on PlannerError); `asyncio.gather` over `_stream_one(task)` per Coder; each Coder commits in its worktree, diff is captured before cleanup; final `summary.md` written to `~/.pm-agent/runs/<run-id>/`
+| Module | Responsibility |
+|---|---|
+| `pm_agent/tasks.py` | `CoderTask` dataclass: id / title / prompt / allowed_paths / acceptance |
+| `pm_agent/runner.py` | `run_claude_async`: spawns `claude -p` with `--setting-sources project,local` to avoid parent-session hook + system-prompt pollution; async event generator |
+| `pm_agent/worktree.py` | `WorktreeManager`: per-task worktree on `ai/<task_id>`, integration worktree on `ai/integration/<run_id>`, base branch auto-detect (master/main), full cleanup in `finally` |
+| `pm_agent/planner.py` | `plan(goal, repo)`: real claude call → strict YAML output; backtick-strip retry; up to 3 attempts with error feedback |
+| `pm_agent/tui.py` | Textual app. Modes: mock / single / multi-coder real / mock-planner / inject-fault. `@work` coroutines for Planner + parallel Coders + integration. |
 
-## Day 1 known issues / mitigations
+## Demo materials
 
-- **[FIXED 2026-05-09]** Hook inheritance + cost (single fix solved both).
-  Was: spawned `claude -p` inherited `~/.claude/settings.json` hooks (laziness-self-report
-  Stop hook, teamagent SessionStart hook), and loaded the full ~40k token user-level
-  system prompt. The laziness Stop hook **replaced the child's real answer** with a
-  forced self-report re-emission. Cost was ~$0.17/call.
-  Fix: pass `--setting-sources project,local` when spawning. This skips user-level
-  settings (where the hooks live) but keeps keychain auth and model defaults.
-  After fix: clean output, `$0.056`/call (-68%), 2.7s/call (-71%).
-  Implemented in `runner.py` as `isolate=True` (default).
-  Alternative (not used): `--bare` — even more aggressive, but requires `ANTHROPIC_API_KEY`
-  env var because it bypasses keychain.
-- **[FIXED 2026-05-09]** `~/.teamagent/hooks/bin-session-start.cjs` no longer errors.
-  Was: `Cannot find module 'web-tree-sitter'`. Fix applied: `cd ~/.teamagent && npm i web-tree-sitter`.
+- **Live recording script**: `docs/demo-narrative.md` — 9 beats with talk-time budgets, known-limit Q&A cheat-sheet
+- **Copy-paste cheat-sheet**: `docs/demo-commands.sh` — 18 named functions, one per beat
+- **SVG snapshots** (`docs/`):
+  - `tui-day2-snapshot.svg` — mock 5-panel layout
+  - `tui-day3-real-snapshot.svg` — single Coder, real stream, $0.057
+  - `tui-day5-multi-snapshot.svg` — 2 parallel Coders via worktree, $0.112
+  - `tui-day6-planner-snapshot.svg` — real Planner emitting 2-task YAML
+  - `tui-day7-e2e-snapshot.svg` — full e2e: real Planner + 2 Coders + diff capture
+  - `tui-day8-integration-snapshot.svg` — integration merge + tests
+  - `tui-day10-polish-snapshot.svg` + `tui-day10-e2e-snapshot.svg` — visual polish + verified e2e
+  - `tui-day11-fault-{planner-yaml,coder-timeout,api-error}-snapshot.svg` — three deterministic recovery demos
+  - `tui-day11-stats-snapshot.svg` — second positive demo (request counter + /stats)
+
+## Implementation notes (load-bearing)
+
+- **`--setting-sources project,local` for spawned `claude -p` is mandatory, not an optimization.** Without it, the parent session's user-level hooks (`laziness-self-report` Stop hook etc.) fire inside the child and overwrite its real answer with a forced self-report; cost also jumps from $0.05 to $0.17 per call because the full ~40k token user-level system prompt is loaded. See `runner.py:isolate=True` default.
+- **Coders need `--dangerously-skip-permissions`.** `claude -p` defaults to deny-all tool calls; without this flag a Coder can't Edit/Write/Bash. Safety boundary is the worktree sandbox itself — bad diffs are intercepted by the integration test, not by claude's permission check.
+- **Branches are deleted by `finally` but the worktree directory is removed first.** This is intentional: integration needs the branch to still exist after per-task worktree cleanup. See `worktree.py:cleanup_worktree` vs `delete_branch`.
+- **Default target repo branch is `master`, not `main`.** WorktreeManager auto-detects.
+- **Mock planner is a fallback, not a degraded mode.** `--mock-planner` exists for layout debugging; real Planner is the always-on primary path with 3-attempt retry + mock as last-resort fallback.
+
+## Known limits (see `docs/demo-narrative.md` for one-line answers)
+
+1. **Contract drift between Coders.** Planner pins shared names in acceptance criteria, integration test catches drift in the merge result. Future: explicit `shared_contract` field in Planner output + Reviewer agent.
+2. **Local-only.** PoC. Productionization path: push branches to remote, auto-open PRs to GitHub, Reviewer agent contract checks, cross-session run persistence.
+3. **2-3 Coder default.** `asyncio.gather` is N-way; only the Planner system prompt caps the task count.
+4. **No automatic rate-limit backoff.** Rate-limit events are surfaced (see `tui-day11-fault-api-error-snapshot.svg`) and recorded in `summary.md`, but retry is the user's decision (to avoid burning money on hard caps).
