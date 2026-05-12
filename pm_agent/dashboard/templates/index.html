@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <title>pm-agent · autonomous loop</title>
   <link rel="stylesheet" href="/static/style.css">
-  <script src="https://unpkg.com/htmx.org@2.0.3"></script>
+  <script src="/static/htmx.min.js"></script>
 </head>
 <body>
   <header>
@@ -12,12 +12,15 @@
     <div id="cumulative-cost"
          hx-get="/api/trend" hx-trigger="load, every 30s" hx-swap="none"
          hx-on::after-request="
-           const data = JSON.parse(event.detail.xhr.responseText);
-           const last = data.points[data.points.length - 1];
-           const cost = last ? last.cumulative_cost_usd : 0;
-           const banner = document.getElementById('cumulative-cost-display');
-           banner.textContent = '$' + cost.toFixed(2);
-           banner.className = cost > 50 ? 'cost-warn' : 'cost-ok';
+           if (!event.detail.successful) return;
+           try {
+             const data = JSON.parse(event.detail.xhr.responseText);
+             const last = data.points[data.points.length - 1];
+             const cost = last ? last.cumulative_cost_usd : 0;
+             const banner = document.getElementById('cumulative-cost-display');
+             banner.textContent = '$' + cost.toFixed(2);
+             banner.className = cost > 50 ? 'cost-warn' : 'cost-ok';
+           } catch(e) { console.warn('cost parse error', e); }
          ">
       Cumulative cost: <span id="cumulative-cost-display" class="cost-ok">$0.00</span>
     </div>
@@ -26,7 +29,11 @@
   <section id="live-cycle"
            hx-get="/api/live" hx-trigger="load, every 1s"
            hx-swap="none"
-           hx-on::after-request="renderLive(JSON.parse(event.detail.xhr.responseText))">
+           hx-on::after-request="
+             if (!event.detail.successful) return;
+             try { renderLive(JSON.parse(event.detail.xhr.responseText)); }
+             catch(e) { console.warn('live parse error', e); }
+           ">
     <h2>Live Cycle</h2>
     <div id="live-cycle-body">Loading…</div>
   </section>
@@ -34,12 +41,22 @@
   <section id="trend-chart"
            hx-get="/api/trend" hx-trigger="load, every 30s"
            hx-swap="none"
-           hx-on::after-request="renderChart(JSON.parse(event.detail.xhr.responseText))">
+           hx-on::after-request="
+             if (!event.detail.successful) return;
+             try { renderChart(JSON.parse(event.detail.xhr.responseText)); }
+             catch(e) { console.warn('trend parse error', e); }
+           ">
     <h2>24-hour trend</h2>
     <canvas id="trend-canvas" width="800" height="240"></canvas>
   </section>
 
   <script>
+    function esc(s) {
+      const d = document.createElement('div');
+      d.appendChild(document.createTextNode(String(s)));
+      return d.innerHTML;
+    }
+
     function renderLive(data) {
       const body = document.getElementById('live-cycle-body');
       if (!data.cycle) {
@@ -48,11 +65,11 @@
       }
       const c = data.cycle;
       const findings = (data.findings || []).map(f =>
-        `<li><b>${f.bug_id}</b> [${f.severity}] — ${f.status} — ${f.title}</li>`
+        `<li><b>${esc(f.bug_id)}</b> [${esc(f.severity)}] — ${esc(f.status)} — ${esc(f.title)}</li>`
       ).join('');
       body.innerHTML = `
-        <p><b>Cycle ${c.id}</b> · status: ${c.status} · started ${c.started_at}</p>
-        <p>Findings: ${c.findings_total} · Cost: $${c.cost_usd.toFixed(4)}</p>
+        <p><b>Cycle ${esc(c.id)}</b> · status: ${esc(c.status)} · started ${esc(c.started_at)}</p>
+        <p>Findings: ${esc(c.findings_total)} · Cost: $${Number(c.cost_usd).toFixed(4)}</p>
         <ul>${findings || '<li><i>no findings yet</i></li>'}</ul>
       `;
     }

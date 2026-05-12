@@ -55,3 +55,39 @@ def test_api_trend_returns_points(seeded_db):
     r = client.get("/api/trend")
     assert r.status_code == 200
     assert "points" in r.json()
+
+
+def test_api_live_running_cycle_returns_findings(tmp_path):
+    """A running cycle with findings should be returned in /api/live."""
+    init_db(tmp_path / "state.db")
+    cid = start_cycle()  # leaves status='running' by default
+    f = Finding(
+        bug_id="run1", title="active fix", severity="High",
+        paths=["b.py"], acceptance=["ok"], evidence="e", kind="bug",
+    )
+    record_finding(cid, f)
+    client = TestClient(create_app())
+    r = client.get("/api/live")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "running"
+    assert data["cycle"] is not None
+    assert data["cycle"]["id"] == cid
+    assert len(data["findings"]) == 1
+    assert data["findings"][0]["bug_id"] == "run1"
+
+
+def test_api_trend_cumulative_cost_accumulates(tmp_path):
+    """Multiple cycles → cumulative_cost monotonically increases per point."""
+    init_db(tmp_path / "state.db")
+    for usd in (0.10, 0.20, 0.30):
+        cid = start_cycle()
+        record_cost(cid, "scanner", usd)
+        finish_cycle(cid, "done", usd)
+    client = TestClient(create_app())
+    r = client.get("/api/trend")
+    points = r.json()["points"]
+    assert len(points) == 3
+    costs = [p["cumulative_cost_usd"] for p in points]
+    assert costs == sorted(costs)  # monotonically non-decreasing
+    assert abs(costs[-1] - 0.60) < 1e-6  # final cumulative
