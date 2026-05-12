@@ -10,9 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import signal
-import threading
 from pathlib import Path
 
 import pytest
@@ -35,38 +32,64 @@ def _empty_scanner_events() -> list[dict]:
     ]
 
 
+async def _fake_sync_pr():
+    """Returns [] immediately — replaces the real gh subprocess call (~1.7s)."""
+    return []
+
+
 def test_daemon_startup_with_empty_db(tmp_path, monkeypatch):
-    """Fresh init: reconciler runs against empty DB; daemon starts; one cycle
-    completes (scanner returns 0 findings → scan-empty); daemon cancellable."""
+    """Fresh init: reconciler runs against empty DB; daemon starts;
+    one cycle completes (scanner returns 0 findings → scan-empty);
+    daemon cancellable."""
     monkeypatch.setenv("HOME", str(tmp_path))
     # Redirect the module-level STATE_DB so run_forever uses tmp_path.
     monkeypatch.setattr(pm_agent.loop, "STATE_DB", tmp_path / ".pm-agent" / "state.db")
     # Monkeypatch run_gates to avoid launching real uv-pytest.
     monkeypatch.setattr(pm_agent.loop, "run_gates", lambda repo: (True, ""))
+    # Monkeypatch sync_pr_states to return immediately (real gh subprocess ~1.7s).
+    monkeypatch.setattr("pm_agent.loop.github.sync_pr_states", lambda: _fake_sync_pr())
 
     with fake_repo() as repo:
         with gh_shim(responses={"pr list": "[]"}):
             with claude_shim(events=_empty_scanner_events()):
                 async def main():
-                    cfg = LoopConfig(interval_s=1)
+                    cfg = LoopConfig(interval_s=60)  # long interval so daemon waits
                     task = asyncio.create_task(run_forever(repo, cfg))
-                    await asyncio.sleep(0.5)
+                    # Wait long enough for the first cycle to complete before
+                    # cancelling. scan subprocess startup can take ~1-2s.
+                    await asyncio.sleep(3.0)
                     task.cancel()
                     try:
-                        await asyncio.wait_for(task, timeout=3.0)
+                        await asyncio.wait_for(task, timeout=5.0)
                     except (asyncio.CancelledError, asyncio.TimeoutError):
                         pass
                 asyncio.run(main())
-    # State DB created + at least one cycle row exists (scan-empty)
+    # State DB created
     db = tmp_path / ".pm-agent" / "state.db"
     assert db.exists()
+    # At least one cycle row exists; none should be left as 'running'
+    persistence.init_db(db)
+    rows = persistence.get_conn().execute(
+        "SELECT status FROM cycles",
+    ).fetchall()
+    assert rows, "no cycle row recorded"
+    assert all(r["status"] != "running" for r in rows), \
+        f"zombie 'running' cycle detected: {[r['status'] for r in rows]}"
 
 
 def test_daemon_sigterm_grace(tmp_path, monkeypatch):
-    """SIGTERM mid-cycle → daemon exits within a few seconds (no hang)."""
+    """Daemon cancellation mid-cycle → daemon exits within 5s.
+
+    Uses task.cancel() instead of os.kill(SIGTERM) — same effect on the
+    daemon's exit path (CancelledError propagates through asyncio.run)
+    but doesn't risk killing pytest itself if the event loop hasn't yet
+    installed the signal handler.
+    """
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(pm_agent.loop, "STATE_DB", tmp_path / ".pm-agent" / "state.db")
     monkeypatch.setattr(pm_agent.loop, "run_gates", lambda repo: (True, ""))
+    # Monkeypatch sync_pr_states to return immediately (real gh subprocess ~1.7s).
+    monkeypatch.setattr("pm_agent.loop.github.sync_pr_states", lambda: _fake_sync_pr())
 
     with fake_repo() as repo:
         with gh_shim(responses={"pr list": "[]"}):
@@ -75,60 +98,59 @@ def test_daemon_sigterm_grace(tmp_path, monkeypatch):
                     cfg = LoopConfig(interval_s=1)
                     task = asyncio.create_task(run_forever(repo, cfg))
                     await asyncio.sleep(0.3)
-                    # Fire SIGTERM
-                    try:
-                        os.kill(os.getpid(), signal.SIGTERM)
-                    except Exception:
-                        # On platforms where signal injection in test is
-                        # problematic, fall back to direct task cancel.
-                        task.cancel()
-                    # Daemon must exit within 5s (worst case: one finding round)
+                    task.cancel()
+                    # Must complete within 5s — worst case one finding round
                     try:
                         await asyncio.wait_for(task, timeout=5.0)
                     except (asyncio.CancelledError, asyncio.TimeoutError):
                         pass
-                try:
-                    asyncio.run(main())
-                except (SystemExit, KeyboardInterrupt):
-                    pass
+                asyncio.run(main())
 
 
 def test_daemon_survives_scanner_crash(tmp_path, monkeypatch):
-    """Scanner shim exits 1 → cycle marked 'errored' → daemon continues."""
+    """Scanner raises Exception → cycle marked 'errored' (spec §5.5)
+    → daemon doesn't crash → recorded the cycle."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(pm_agent.loop, "STATE_DB", tmp_path / ".pm-agent" / "state.db")
     monkeypatch.setattr(pm_agent.loop, "run_gates", lambda repo: (True, ""))
+    # Monkeypatch sync_pr_states to return immediately (real gh subprocess ~1.7s).
+    monkeypatch.setattr("pm_agent.loop.github.sync_pr_states", lambda: _fake_sync_pr())
+
+    # Force scanner.scan to raise — exercises spec §5.5 'errored' path
+    async def _crashing_scan(*args, **kwargs):
+        raise RuntimeError("simulated scanner crash")
+
+    monkeypatch.setattr("pm_agent.loop.scanner.scan", _crashing_scan)
 
     with fake_repo() as repo:
         with gh_shim(responses={"pr list": "[]"}):
-            with claude_shim(error_at="init"):  # shim exits 1
-                async def main():
-                    cfg = LoopConfig(interval_s=1)
-                    task = asyncio.create_task(run_forever(repo, cfg))
-                    await asyncio.sleep(0.5)
-                    task.cancel()
-                    try:
-                        await asyncio.wait_for(task, timeout=3.0)
-                    except (asyncio.CancelledError, asyncio.TimeoutError):
-                        pass
-                asyncio.run(main())
-    # Daemon didn't crash — that's the primary assertion (no exception above).
-    # The DB may or may not exist depending on how fast cancellation fires
-    # relative to run_forever's init_db call.
+            async def main():
+                # interval_s=60 ensures daemon waits between cycles; we cancel
+                # during the inter-cycle sleep, not mid-cycle.
+                cfg = LoopConfig(interval_s=60)
+                task = asyncio.create_task(run_forever(repo, cfg))
+                # Scanner crash is instant; give generous buffer for startup.
+                await asyncio.sleep(0.6)
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=3.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+            asyncio.run(main())
+
+    # Verify cycle recorded with errored status (spec §5.5 path)
     db = tmp_path / ".pm-agent" / "state.db"
-    if db.exists():
-        persistence.init_db(db)
-        rows = persistence.get_conn().execute(
-            "SELECT status FROM cycles",
-        ).fetchall()
-        # Scanner crash scenario: the shim exits 1 so scanner.scan() returns
-        # ([], cost) — not an exception. Combined with task cancellation at
-        # various points in the cycle, valid statuses include 'running'
-        # (cancelled before finish_cycle ran), 'errored', 'aborted', 'scan-empty'.
-        # All non-errored states from the daemon's own code are correct here.
-        valid = ("running", "errored", "aborted", "scan-empty", "done")
-        if rows:
-            assert all(r["status"] in valid for r in rows)
+    assert db.exists()
+    persistence.init_db(db)
+    rows = persistence.get_conn().execute(
+        "SELECT status FROM cycles",
+    ).fetchall()
+    # At least one cycle must exist and at least one must be 'errored'
+    # (cancellation may add an 'aborted' row from the next iteration too)
+    statuses = [r["status"] for r in rows]
+    assert rows, "no cycle row recorded"
+    assert "errored" in statuses, \
+        f"spec §5.5 errored path not exercised; got: {statuses}"
 
 
 def test_daemon_halts_on_gh_auth_failure(tmp_path, monkeypatch):
