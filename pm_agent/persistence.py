@@ -86,7 +86,15 @@ def _now() -> str:
 
 
 def init_db(path: Path) -> None:
-    """Open + create schema + enable WAL. Idempotent."""
+    """Open + create schema + enable WAL. Idempotent.
+
+    On re-init in the same thread, closes the existing connection before clearing
+    the thread-local pool to avoid file-handle leaks.
+
+    NOTE: This only clears the CALLING thread's pool. Other threads holding
+    conns from a prior init_db will keep using the old DB file. For tests
+    that re-init across threads, ensure background threads are joined first.
+    """
     global _DB_PATH
     _DB_PATH = Path(path)
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -96,7 +104,13 @@ def init_db(path: Path) -> None:
     conn.executescript(SCHEMA)
     conn.commit()
     conn.close()
-    _LOCAL.__dict__.clear()  # reset thread-local pool so re-init in tests gets a fresh conn
+    # Close any existing thread-local conn before clearing the pool
+    if hasattr(_LOCAL, "conn"):
+        try:
+            _LOCAL.conn.close()
+        except Exception:
+            pass
+    _LOCAL.__dict__.clear()
 
 
 def get_conn() -> sqlite3.Connection:
@@ -113,13 +127,21 @@ def get_conn() -> sqlite3.Connection:
 
 @contextmanager
 def transaction() -> Iterator[sqlite3.Connection]:
-    """Multi-statement scoping with BEGIN/COMMIT/ROLLBACK."""
+    """Multi-statement scoping with BEGIN/COMMIT/ROLLBACK.
+
+    On exception inside the with-block, attempts ROLLBACK best-effort; the
+    ROLLBACK's own failure (if any) is suppressed so the original exception
+    surfaces with its traceback intact.
+    """
     c = get_conn()
     c.execute("BEGIN")
     try:
         yield c
     except Exception:
-        c.execute("ROLLBACK")
+        try:
+            c.execute("ROLLBACK")
+        except Exception:
+            pass  # best-effort; original exception takes priority
         raise
     else:
         c.execute("COMMIT")
@@ -141,26 +163,29 @@ def finish_cycle(cycle_id: int, status: CycleStatus, cost_usd: float) -> None:
 
 
 def record_finding(cycle_id: int, finding: Finding) -> int:
-    """INSERT OR IGNORE; returns existing finding_id on (cycle_id, bug_id) collision."""
+    """INSERT OR IGNORE; returns existing finding_id on (cycle_id, bug_id) collision.
+
+    Raises ValueError if the row could not be inserted AND does not already exist —
+    typically a CHECK constraint violation (invalid severity/kind/status).
+    """
     c = get_conn()
     c.execute(
         """INSERT OR IGNORE INTO findings
            (cycle_id, bug_id, title, severity, paths_json, acceptance_json, kind, status)
            VALUES (?, ?, ?, ?, ?, ?, ?, 'discovered')""",
-        (
-            cycle_id,
-            finding.bug_id,
-            finding.title,
-            finding.severity,
-            json.dumps(finding.paths),
-            json.dumps(finding.acceptance),
-            finding.kind,
-        ),
+        (cycle_id, finding.bug_id, finding.title, finding.severity,
+         json.dumps(finding.paths), json.dumps(finding.acceptance), finding.kind),
     )
     row = c.execute(
         "SELECT id FROM findings WHERE cycle_id=? AND bug_id=?",
         (cycle_id, finding.bug_id),
     ).fetchone()
+    if row is None:
+        raise ValueError(
+            f"record_finding failed for bug_id={finding.bug_id!r}: CHECK constraint "
+            f"likely rejected the row (severity={finding.severity!r}, kind={finding.kind!r}). "
+            f"No row inserted and no existing row found."
+        )
     return row["id"]
 
 
@@ -216,49 +241,64 @@ def reconcile(repo: Path) -> ReconcileReport:
     git artifacts in `repo`. Idempotent.
 
     Per spec §3: status='running' cycles → 'aborted';
-                  status='fixing-*'/'integrating'/'testing'/'routing' findings → 'interrupted'.
+                  status in {fixing-code, fixing-test, integrating, testing, routing}
+                  findings → 'interrupted'.
+
+    Counters in ReconcileReport reflect successful cleanups only — failed
+    git subprocess calls do NOT bump the counter.
     """
     report = ReconcileReport()
-    c = get_conn()
-    # Mark zombie cycles
-    r = c.execute(
-        "UPDATE cycles SET status='aborted', finished_at=? WHERE status='running'",
-        (_now(),),
-    )
-    report.zombie_cycles = r.rowcount
-    # Mark zombie findings
-    r = c.execute(
-        """UPDATE findings SET status='interrupted'
-           WHERE status IN ('fixing-code','fixing-test','integrating','testing','routing')""",
-    )
-    report.zombie_findings = r.rowcount
-    # Clean orphan worktrees
+    # Zombie cycle + finding updates wrapped in a transaction so the two
+    # tables stay internally consistent if the daemon crashes between them.
+    with transaction() as c:
+        r = c.execute(
+            "UPDATE cycles SET status='aborted', finished_at=? WHERE status='running'",
+            (_now(),),
+        )
+        report.zombie_cycles = r.rowcount
+        r = c.execute(
+            """UPDATE findings SET status='interrupted'
+               WHERE status IN ('fixing-code','fixing-test','integrating','testing','routing')""",
+        )
+        report.zombie_findings = r.rowcount
+
+    # Clean orphan worktrees + branches. repo may not exist (e.g. test scenario);
+    # bail gracefully.
+    if not repo.exists():
+        return report
+
     wt_dir = repo / ".pm-agent-worktrees"
     if wt_dir.exists():
         for d in wt_dir.iterdir():
             if d.is_dir() and d.name != ".lock":
-                subprocess.run(
+                rc = subprocess.run(
                     ["git", "worktree", "remove", "--force", str(d)],
-                    cwd=repo,
-                    capture_output=True,
-                )
+                    cwd=repo, capture_output=True,
+                ).returncode
+                cleaned = (rc == 0)
                 if d.exists():
+                    # Fallback: rmtree counts as cleanup if it removes the dir.
                     shutil.rmtree(d, ignore_errors=True)
-                report.orphan_worktrees += 1
-    # Clean orphan branches
-    out = subprocess.run(
-        ["git", "branch", "--list", "ai/*"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-    ).stdout
+                    cleaned = cleaned or (not d.exists())
+                if cleaned:
+                    report.orphan_worktrees += 1
+
+    try:
+        out = subprocess.run(
+            ["git", "branch", "--list", "ai/*"],
+            cwd=repo, capture_output=True, text=True, check=False,
+        ).stdout
+    except FileNotFoundError:
+        # git not on PATH (rare); bail
+        return report
+
     for line in out.splitlines():
-        branch = line.strip().lstrip("* ")
+        branch = line.strip().lstrip("* ").strip()
         if branch and branch.startswith("ai/"):
-            subprocess.run(
+            rc = subprocess.run(
                 ["git", "branch", "-D", branch],
-                cwd=repo,
-                capture_output=True,
-            )
-            report.orphan_branches += 1
+                cwd=repo, capture_output=True,
+            ).returncode
+            if rc == 0:
+                report.orphan_branches += 1
     return report
