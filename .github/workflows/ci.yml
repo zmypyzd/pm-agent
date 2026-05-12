@@ -28,10 +28,11 @@ jobs:
           uv run pytest tests/
           --cov=pm_agent.scanner --cov=pm_agent.persistence --cov=pm_agent.github
           --cov=pm_agent.loop --cov=pm_agent.cli --cov=pm_agent.dashboard --cov=pm_agent.tasks
+          --cov=pm_agent.preflight --cov=pm_agent.report
           --cov-report=term-missing --cov-fail-under=70 -q
 
       - name: Run mypy
-        run: uv run mypy pm_agent/scanner.py pm_agent/persistence.py pm_agent/github.py pm_agent/loop.py pm_agent/cli.py pm_agent/dashboard/server.py pm_agent/tasks.py
+        run: uv run mypy pm_agent/scanner.py pm_agent/persistence.py pm_agent/github.py pm_agent/loop.py pm_agent/cli.py pm_agent/dashboard/server.py pm_agent/tasks.py pm_agent/preflight.py pm_agent/report.py
 
       - name: Run ruff
-        run: uv run ruff check pm_agent/scanner.py pm_agent/persistence.py pm_agent/github.py pm_agent/loop.py pm_agent/cli.py pm_agent/dashboard/server.py pm_agent/tasks.py
+        run: uv run ruff check pm_agent/scanner.py pm_agent/persistence.py pm_agent/github.py pm_agent/loop.py pm_agent/cli.py pm_agent/dashboard/server.py pm_agent/tasks.py pm_agent/preflight.py pm_agent/report.py

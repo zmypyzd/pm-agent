@@ -5,6 +5,8 @@ Subcommands:
   pm-agent tui [args]            Explicit TUI invocation; passes args through.
   pm-agent loop run [opts]       Start the autonomous-loop daemon.
   pm-agent loop status           Print current running cycle, if any.
+  pm-agent loop preflight        30-second readiness check before a dry run.
+  pm-agent loop report           Summarise state.db after a dry run.
   pm-agent loop trigger-now      Dev helper (no-op in this build; see Task 11).
   pm-agent dashboard serve [opts] Start the FastAPI + HTMX dashboard.
 """
@@ -43,6 +45,31 @@ def cmd_loop_run(args: argparse.Namespace) -> int:
     # other exit besides GhAuthError which propagates).
     print("interrupted", file=sys.stderr)
     return 130
+
+
+def cmd_loop_preflight(args: argparse.Namespace) -> int:
+    from pm_agent.loop import STATE_DB
+    from pm_agent import preflight as pf
+
+    state_db = STATE_DB
+    repo = Path(args.repo) if hasattr(args, "repo") and args.repo else Path.cwd()
+
+    results, all_passed = pf.run_preflight(state_db, repo)
+    pf.print_preflight(results, all_passed)
+    return 0 if all_passed else 1
+
+
+def cmd_loop_report(args: argparse.Namespace) -> int:
+    from pm_agent.loop import STATE_DB
+    from pm_agent import report as rpt
+
+    if hasattr(args, "db") and args.db:
+        db_path = Path(args.db)
+    else:
+        db_path = STATE_DB
+
+    rpt.print_report(db_path)
+    return 0
 
 
 def cmd_loop_status(args: argparse.Namespace) -> int:
@@ -101,6 +128,20 @@ def _build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser, a
     p_loop_run.add_argument("--coder-timeout", type=float, default=180.0)
     p_loop_run.add_argument("--test-timeout", type=float, default=120.0)
     sub_loop.add_parser("status", help="show current running cycle")
+    p_preflight = sub_loop.add_parser(
+        "preflight", help="30s readiness check before a dry run"
+    )
+    p_preflight.add_argument(
+        "--repo", type=Path, default=Path.cwd(),
+        help="target git repo to check (default: cwd)",
+    )
+    p_report = sub_loop.add_parser(
+        "report", help="summarise state.db after a dry run"
+    )
+    p_report.add_argument(
+        "--db", type=Path, default=None,
+        help="path to state.db (default: ~/.pm-agent/state.db)",
+    )
 
     # dashboard
     p_dash = sub.add_parser("dashboard", help="FastAPI web dashboard")
@@ -130,6 +171,10 @@ def main() -> int:
             return cmd_loop_run(args)
         if args.loop_cmd == "status":
             return cmd_loop_status(args)
+        if args.loop_cmd == "preflight":
+            return cmd_loop_preflight(args)
+        if args.loop_cmd == "report":
+            return cmd_loop_report(args)
         p_loop.print_help()  # bare 'pm-agent loop' shows loop's help
         return 2
     if args.cmd == "dashboard":
