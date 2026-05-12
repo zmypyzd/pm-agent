@@ -15,7 +15,6 @@ import subprocess
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Literal
 
 from pm_agent import github, persistence, scanner
 from pm_agent.runner import run_claude_async

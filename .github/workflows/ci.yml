@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run pytest with coverage
+        # Coverage measured over Beta-loop modules only (pre-Beta modules tui/planner/runner/worktree
+        # are excluded — they predate the typed-Python standard and drag the total below threshold).
+        # Current Beta-module coverage: ~74%. Raise threshold as tests are added.
+        run: >
+          uv run pytest tests/
+          --cov=pm_agent.scanner --cov=pm_agent.persistence --cov=pm_agent.github
+          --cov=pm_agent.loop --cov=pm_agent.cli --cov=pm_agent.dashboard --cov=pm_agent.tasks
+          --cov-report=term-missing --cov-fail-under=70 -q
+
+      - name: Run mypy
+        run: uv run mypy pm_agent/scanner.py pm_agent/persistence.py pm_agent/github.py pm_agent/loop.py pm_agent/cli.py pm_agent/dashboard/server.py
+
+      - name: Run ruff
+        run: uv run ruff check pm_agent/scanner.py pm_agent/persistence.py pm_agent/github.py pm_agent/loop.py pm_agent/cli.py pm_agent/dashboard/server.py

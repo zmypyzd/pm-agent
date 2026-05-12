@@ -6,7 +6,6 @@ change the id, so the 3-cycle skip gate is robust.
 """
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import re
 import subprocess
