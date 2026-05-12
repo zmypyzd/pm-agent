@@ -60,9 +60,19 @@ findings:
 
 
 def test_scan_malformed_yaml_returns_empty():
-    """malformed YAML after exhausting retries → empty findings list (no exception)."""
-    bad = "this is not yaml at all"
+    """scan returns ([], cost) when YAML can't be parsed across retries."""
+    # Unclosed quote forces a real yaml.YAMLError (ParserError):
+    bad_yaml = '```yaml\nfindings:\n  - title: "unclosed quote\n```'
     with fake_repo() as repo:
-        with claude_shim(events=_scanner_events(bad)):
+        with claude_shim(events=_scanner_events(bad_yaml)):
+            findings, _cost = asyncio.run(scan(repo, max_retries=0))
+    assert findings == []
+
+
+def test_scan_max_retries_bounds_attempts():
+    """max_retries=0 means exactly 1 attempt; bad yaml exhausts in one shot."""
+    bad_yaml = '```yaml\nfindings:\n  - title: "broken\n```'
+    with fake_repo() as repo:
+        with claude_shim(events=_scanner_events(bad_yaml)):
             findings, _cost = asyncio.run(scan(repo, max_retries=0))
     assert findings == []

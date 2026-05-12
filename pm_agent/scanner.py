@@ -39,8 +39,7 @@ You are an autonomous code auditor for the pm-agent repository.
 
 Your ONLY output is one ```yaml fenced block. No prose. Do NOT call tools.
 
-Find up to {max_findings} bugs in the repository. If you find none, fall back
-to tech-debt (refactor opportunities, missing tests, dead code, drift).
+Find up to {max_findings} bugs in the repository.{fallback_hint}
 
 YAML rules — non-negotiable:
 - No backticks, no curly braces, no square brackets inside string values.
@@ -74,8 +73,14 @@ Produce the YAML now.
 
 
 def _normalize_bug_id(paths: list[str], kind: Kind) -> str:
-    """sha1(kind + "|" + "|".join(sorted(paths)))[:8] — stable across title reword."""
-    payload = f"{kind}|" + "|".join(sorted(paths))
+    """sha1(kind + RS + RS.join(sorted(paths)))[:8].
+
+    Uses ASCII 0x1e (Record Separator) which is not a valid char in POSIX
+    filenames, preventing collisions like ['a|b'] vs ['a', 'b'] that the
+    earlier '|' separator would conflate.
+    """
+    rs = "\x1e"
+    payload = f"{kind}{rs}" + rs.join(sorted(paths))
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:8]
 
 
@@ -100,7 +105,14 @@ def _list_repo_files(repo: Path, max_files: int = 60) -> str:
 
 
 def _extract_yaml(text: str) -> str:
+    """Pull YAML out of a fenced block; tolerate naked YAML as fallback.
+
+    Tries ```yaml first, then plain ``` (planner.py pattern), then raw text.
+    """
     m = re.search(r"```ya?ml\s*\n(.+?)\n?```", text, re.DOTALL)
+    if m:
+        return m.group(1)
+    m = re.search(r"```\s*\n(.+?)\n?```", text, re.DOTALL)
     if m:
         return m.group(1)
     return text.strip()
@@ -151,7 +163,15 @@ async def scan(
     is implemented by the system prompt — Scanner LLM is told to fall back
     if it can't find bugs."""
     user_prompt = _USER_PROMPT.format(repo=repo, files=_list_repo_files(repo))
-    system = SCANNER_SYSTEM.format(max_findings=max_findings)
+    fallback_hint = (
+        " If you find none, fall back to tech-debt (refactor opportunities, "
+        "missing tests, dead code, drift)."
+        if fallback_to_tech_debt else ""
+    )
+    system = SCANNER_SYSTEM.format(
+        max_findings=max_findings,
+        fallback_hint=fallback_hint,
+    )
     total_cost = 0.0
     last_error: str | None = None
     for attempt in range(max_retries + 1):
@@ -176,8 +196,13 @@ async def scan(
                 if ev.get("is_error"):
                     is_error = True
                     last_error = str(ev.get("result") or "api error")
-        if is_error and not chunks:
-            continue  # retry
+            elif et == "system":
+                st = ev.get("subtype")
+                if st in ("timeout", "spawn_error"):
+                    is_error = True
+                    last_error = f"{st}: {ev.get('error') or ev.get('elapsed_s')}"
+        if is_error:
+            continue  # retry on any API error, even if partial chunks landed
         text = "".join(chunks)
         if not text.strip():
             last_error = "empty response"
