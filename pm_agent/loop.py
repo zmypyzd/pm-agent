@@ -340,6 +340,15 @@ async def run_one_cycle(
                     pr = await github.auto_merge(pr_branch, finding)
                 else:
                     pr = await github.open_pr(pr_branch, finding, body_extras=gate_output)
+                # BUG-R4-1: a failed gh-pr-create returns
+                # PRResult(action="failed", number=0). Previously we still
+                # called record_pr (collision on UNIQUE github_number when
+                # a second PR also failed) and update_finding(..., "done")
+                # and bumped findings_fixed — counting the failure as a fix.
+                # Treat failed PR routing as a finding-level failure.
+                if pr.action == "failed":
+                    persistence.update_finding(finding_id, "failed")
+                    continue
                 persistence.record_pr(
                     finding_id, pr.number, pr.url, state="open", action=pr.action,
                 )

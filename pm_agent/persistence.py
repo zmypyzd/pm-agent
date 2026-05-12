@@ -206,6 +206,18 @@ def update_finding(finding_id: int, status: FindingStatus) -> None:
 
 
 def record_pr(finding_id: int, gh_number: int, url: str, state: str, action: str) -> int:
+    """Insert a PR row. Returns lastrowid, or -1 when the call is a no-op.
+
+    BUG-R4-1: when ``gh pr create`` fails (no remote, auth expired, rate
+    limit, branch protection), the upstream caller used to pass
+    ``gh_number=0``. Two such "failed PR" rows in one cycle then collided
+    on the ``github_number UNIQUE`` constraint and crashed the finding.
+    Refuse to insert when ``gh_number <= 0``; failed PR creates carry no
+    durable identity and need no row. Callers must still mark the
+    finding as failed — see ``loop.py``.
+    """
+    if gh_number <= 0:
+        return -1
     cur = get_conn().execute(
         """INSERT INTO prs (finding_id, github_number, url, state, action, created_at)
            VALUES (?, ?, ?, ?, ?, ?)""",

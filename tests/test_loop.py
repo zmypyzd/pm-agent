@@ -165,3 +165,42 @@ def test_per_finding_cleanup_survives_cancel():
     assert saw_cancel, "CancelledError must be re-raised after cleanups complete"
     for i, m in enumerate(cleanups_after, start=2):
         assert m.called, f"cleanup step {i} skipped — R3-A-02 regression"
+
+
+def test_run_one_cycle_skips_record_pr_on_failed_action():
+    """BUG-R4-1: when github.open_pr / auto_merge returns
+    ``PRResult(action="failed", number=0)``, the cycle loop must:
+      (a) not call ``persistence.record_pr`` (it would crash on the
+          UNIQUE github_number=0 collision when ≥2 PRs fail per cycle),
+      (b) mark the finding ``failed``, not ``done``,
+      (c) NOT increment ``findings_fixed``.
+
+    Verified structurally — the inline guard must reference both
+    ``pr.action`` and ``"failed"`` and route via ``update_finding(...,
+    "failed")`` followed by ``continue`` before record_pr is reachable.
+    Behavioral coverage is in ``reproductions/r4/bug_R4_1_*.py`` (at the
+    persistence layer)."""
+    import inspect, re
+    import pm_agent.loop as loop_mod
+
+    src = inspect.getsource(loop_mod.run_one_cycle)
+    # The guard pattern: a `pr.action == "failed"` check that marks the
+    # finding failed and continues BEFORE record_pr is called.
+    pattern = re.compile(
+        r'if\s+pr\.action\s*==\s*"failed"\s*:\s*\n'
+        r'\s+persistence\.update_finding\([^,]+,\s*"failed"\)\s*\n'
+        r'\s+continue',
+        re.MULTILINE,
+    )
+    assert pattern.search(src), (
+        "regression: run_one_cycle no longer guards record_pr against "
+        "pr.action == 'failed'. BUG-R4-1 will recur as soon as gh pr "
+        "create fails twice in one cycle."
+    )
+
+    # Sanity: the guard must precede the first record_pr call site.
+    guard_pos = src.find('pr.action == "failed"')
+    record_pos = src.find("persistence.record_pr(")
+    assert 0 < guard_pos < record_pos, (
+        "regression: the action='failed' guard must run BEFORE record_pr"
+    )
