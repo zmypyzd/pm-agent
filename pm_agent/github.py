@@ -34,23 +34,57 @@ class GhAuthError(RuntimeError):
     """Raised when gh CLI reports authentication failure. Daemon halts."""
 
 
-async def _gh(*args: str, capture: bool = True) -> tuple[int, str, str]:
+_AUTH_MARKERS = (
+    "authentication",
+    "gh auth login",
+    "bad credentials",
+    "401",
+    "unauthorized",
+    "credentials",
+    "no authentication token",
+)
+
+
+def _is_auth_failure(stderr: str) -> bool:
+    """gh signals auth failure via varied stderr messages depending on version
+    and error type. We err on the side of broader matching — daemon halt is
+    preferable to looping forever against an unauthenticated gh."""
+    s = stderr.lower()
+    return any(m in s for m in _AUTH_MARKERS)
+
+
+async def _gh(*args: str) -> tuple[int, str, str]:
     """Call gh with args; return (returncode, stdout, stderr).
 
     Raises GhAuthError when gh reports authentication failure — caller (loop.py)
     should halt the daemon and surface this prominently in the dashboard.
+
+    Wraps communicate() in asyncio.wait_for(timeout=30s) so a hung gh
+    (stale credential prompt / network timeout) does not block the daemon's
+    event loop indefinitely.
     """
     proc = await asyncio.create_subprocess_exec(
         "gh", *args,
-        stdout=asyncio.subprocess.PIPE if capture else None,
+        stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    out, err = await proc.communicate()
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+    except asyncio.TimeoutError:
+        try:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        except (ProcessLookupError, asyncio.TimeoutError):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        return 124, "", "gh timeout after 30s"
     stdout = out.decode("utf-8", errors="replace") if out else ""
     stderr = err.decode("utf-8", errors="replace") if err else ""
-    rc = proc.returncode or 0
-    # gh's auth failure stderr typically contains "authentication" or "gh auth login"
-    if rc != 0 and ("authentication" in stderr.lower() or "gh auth login" in stderr.lower()):
+    assert proc.returncode is not None, "communicate() must set returncode"
+    rc = proc.returncode
+    if rc != 0 and _is_auth_failure(stderr):
         raise GhAuthError(f"gh auth failure: {stderr.strip()[:200]}")
     return rc, stdout, stderr
 
@@ -69,9 +103,13 @@ def _build_pr_body(finding: Finding, body_extras: str = "") -> str:
 
 
 async def _find_existing_pr(branch: str) -> dict | None:
-    """Return first PR with given head ref, or None."""
+    """Return first OPEN PR with given head ref, or None.
+
+    Filtered to --state open: a closed PR on the same branch is not a hit;
+    we want to know if there's a live PR we can reuse (idempotency).
+    """
     rc, out, _err = await _gh(
-        "pr", "list", "--head", branch, "--state", "all",
+        "pr", "list", "--head", branch, "--state", "open",
         "--json", "number,url,state", "--limit", "1",
     )
     if rc != 0 or not out.strip():
@@ -113,14 +151,27 @@ async def open_pr(branch: str, finding: Finding, body_extras: str = "") -> PRRes
 
 
 async def auto_merge(branch: str, finding: Finding) -> PRResult:
-    """open_pr + gh pr merge --auto --squash. action reflects merge state."""
+    """open_pr + gh pr merge --auto --squash. action reflects merge state.
+
+    Distinguishes 'auto-merge-queued' (waiting on CI / branch protection)
+    from 'merged-now' (gh applied the merge immediately). gh's queued message
+    contains 'will be automatically merged ...' which would otherwise match
+    the naive 'merged' substring — check queued markers first.
+    """
     pr = await open_pr(branch, finding)
     if pr.action == "failed":
         return pr
     rc, out, _err = await _gh("pr", "merge", str(pr.number), "--auto", "--squash")
     if rc != 0:
         return PRResult(number=pr.number, url=pr.url, action="failed")
-    action: PRAction = "merged-now" if "merged" in out.lower() else "auto-merge-queued"
+    out_l = out.lower()
+    queued = any(marker in out_l for marker in (
+        "automatically merged",
+        "will be merged",
+        "set to merge",  # older gh phrasing
+        "queued",
+    ))
+    action: PRAction = "auto-merge-queued" if queued else "merged-now"
     return PRResult(number=pr.number, url=pr.url, action=action)
 
 

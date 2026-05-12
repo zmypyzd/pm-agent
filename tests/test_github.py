@@ -62,3 +62,38 @@ def test_sync_pr_states_returns_states():
     assert all(isinstance(s, PRState) for s in states)
     merged = [s for s in states if s.state == "merged"]
     assert len(merged) == 1
+
+
+def test_gh_auth_error_raised_on_auth_failure():
+    """gh_shim auth_failure=True → GhAuthError raised, not silently consumed."""
+    from pm_agent.github import GhAuthError
+    with gh_shim(auth_failure=True):
+        with pytest.raises(GhAuthError):
+            asyncio.run(open_pr("ai/T-X", _finding()))
+
+
+def test_auto_merge_distinguishes_queued_from_merged_now():
+    """gh queued message contains 'merged' (in 'automatically merged') —
+    must NOT label as merged-now. This is the spec-driven correctness check."""
+    queued_msg = "✓ Pull request #5 will be automatically merged after meeting the required conditions"
+    responses = {
+        "pr list": json.dumps([]),
+        "pr create": json.dumps({"number": 5, "url": "https://gh/x/y/pull/5"}),
+        "pr merge": queued_msg,
+    }
+    with gh_shim(responses=responses):
+        result = asyncio.run(auto_merge("ai/T-3", _finding()))
+    assert result.action == "auto-merge-queued"
+
+
+def test_auto_merge_detects_immediate_merge():
+    """gh's immediate-merge message: 'Pull request #N merged' (no 'automatically')."""
+    merged_msg = "✓ Pull request #6 merged"
+    responses = {
+        "pr list": json.dumps([]),
+        "pr create": json.dumps({"number": 6, "url": "https://gh/x/y/pull/6"}),
+        "pr merge": merged_msg,
+    }
+    with gh_shim(responses=responses):
+        result = asyncio.run(auto_merge("ai/T-4", _finding()))
+    assert result.action == "merged-now"
