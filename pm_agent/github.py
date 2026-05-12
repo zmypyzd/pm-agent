@@ -62,9 +62,16 @@ async def _gh(*args: str) -> tuple[int, str, str]:
     Wraps communicate() in asyncio.wait_for(timeout=30s) so a hung gh
     (stale credential prompt / network timeout) does not block the daemon's
     event loop indefinitely.
+
+    stdin is pinned to DEVNULL: if gh ever decides to prompt (rare interactive
+    flows like `pr merge` without --yes, or `pr create` with missing fields)
+    and the daemon was launched from a TTY, the subprocess would otherwise
+    inherit our stdin and block until the 30s timeout. DEVNULL makes any
+    such prompt return EOF immediately, surfacing as a clean non-zero exit.
     """
     proc = await asyncio.create_subprocess_exec(
         "gh", *args,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -161,8 +168,16 @@ async def auto_merge(branch: str, finding: Finding) -> PRResult:
     pr = await open_pr(branch, finding)
     if pr.action == "failed":
         return pr
-    rc, out, _err = await _gh("pr", "merge", str(pr.number), "--auto", "--squash")
+    rc, out, err = await _gh(
+        "pr", "merge", str(pr.number), "--auto", "--squash", "--yes",
+    )
     if rc != 0:
+        # gh returns non-zero with "auto-merge is already enabled" stderr when
+        # a previous queue for this PR is still valid — that's not a failure,
+        # the auto-merge state we wanted is already in place.
+        err_l = err.lower()
+        if "already enabled" in err_l or "auto-merge enabled" in err_l:
+            return PRResult(number=pr.number, url=pr.url, action="auto-merge-queued")
         return PRResult(number=pr.number, url=pr.url, action="failed")
     out_l = out.lower()
     queued = any(marker in out_l for marker in (
@@ -170,6 +185,7 @@ async def auto_merge(branch: str, finding: Finding) -> PRResult:
         "will be merged",
         "set to merge",  # older gh phrasing
         "queued",
+        "already enabled",  # covers stdout variant of "auto-merge is already enabled"
     ))
     action: PRAction = "auto-merge-queued" if queued else "merged-now"
     return PRResult(number=pr.number, url=pr.url, action=action)

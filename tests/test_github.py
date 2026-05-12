@@ -97,3 +97,44 @@ def test_auto_merge_detects_immediate_merge():
     with gh_shim(responses=responses):
         result = asyncio.run(auto_merge("ai/T-4", _finding()))
     assert result.action == "merged-now"
+
+
+def test_auto_merge_already_enabled_is_queued_not_failed():
+    """R3-B-03: gh emits 'auto-merge is already enabled' to stderr with rc!=0
+    when a previous --auto queue is still valid. That's not a failure — the
+    auto-merge state we wanted is already in place; classify as queued."""
+    responses = {
+        "pr list": json.dumps([]),
+        "pr create": json.dumps({"number": 8, "url": "https://gh/x/y/pull/8"}),
+        "pr merge": {
+            "stdout": "",
+            "stderr": "auto-merge is already enabled for PR #8",
+            "exit_code": 1,
+        },
+    }
+    with gh_shim(responses=responses):
+        result = asyncio.run(auto_merge("ai/T-5", _finding()))
+    assert result.action == "auto-merge-queued", (
+        f"expected auto-merge-queued, got {result.action!r}"
+    )
+    assert result.number == 8
+
+
+def test_gh_passes_yes_flag_to_pr_merge():
+    """R3-B-05 companion: --yes must be in the pr merge argv so gh doesn't
+    prompt interactively. The shim records every argv token; we assert
+    --yes is among them on the 'pr merge' call."""
+    responses = {
+        "pr list": json.dumps([]),
+        "pr create": json.dumps({"number": 9, "url": "https://gh/x/y/pull/9"}),
+        "pr merge": "✓ Pull request #9 set to merge automatically",
+    }
+    with gh_shim(responses=responses, record_calls=True) as shim:
+        asyncio.run(auto_merge("ai/T-6", _finding()))
+        recorded = shim["record"].read_text()
+    # Find the pr merge call block specifically
+    tokens = recorded.split()
+    assert "merge" in tokens, "pr merge was never invoked"
+    assert "--yes" in tokens, (
+        f"--yes missing from gh argv (got {tokens!r})"
+    )
