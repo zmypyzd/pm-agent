@@ -5,7 +5,11 @@ __pycache__/
 .DS_Store
 uv.lock
 .pm-agent/
-.teamagent/knowledge.db
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.teamagent/knowledge.db*
 .teamagent/shared-claude.md
 .teamagent/team/
 .teamagent/shared-skills/
