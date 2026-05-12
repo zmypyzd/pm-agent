@@ -217,161 +217,180 @@ async def run_one_cycle(
     findings_total = findings_fixed = findings_skipped = 0
     broke_early = False
     cycle_status: persistence.CycleStatus = "done"
+    cycle_finished = False  # guard against double finish_cycle
 
-    if stop_event and stop_event.is_set():
-        persistence.finish_cycle(cycle_id, "done", 0.0)
-        return CycleResult(cycle_id, 0, 0, 0, 0.0, time.time() - t0)
-
-    # 1. sync PR states
-    try:
-        states = await github.sync_pr_states()
-        for s in states:
-            persistence.update_pr_state(s.number, s.state)
-    except github.GhAuthError:
-        log.error("gh auth failure — halting")
-        persistence.finish_cycle(cycle_id, "errored", 0.0)
-        raise
-
-    if stop_event and stop_event.is_set():
-        persistence.finish_cycle(cycle_id, "done", 0.0)
-        return CycleResult(cycle_id, 0, 0, 0, 0.0, time.time() - t0)
-
-    # 2. scan
-    try:
-        findings, scan_cost = await scanner.scan(repo, max_retries=cfg.max_retries)
-        persistence.record_cost(cycle_id, "scanner", scan_cost)
-        total_cost += scan_cost
-    except Exception:
-        log.exception("scanner crashed")
-        persistence.finish_cycle(cycle_id, "errored", total_cost)
-        return CycleResult(cycle_id, 0, 0, 0, total_cost, time.time() - t0)
-
-    findings_total = len(findings)
-    if not findings:
-        persistence.finish_cycle(cycle_id, "scan-empty", total_cost)
-        return CycleResult(cycle_id, 0, 0, 0, total_cost, time.time() - t0)
-
-    wm = WorktreeManager(repo)
-    # 3. per-finding loop
-    for finding in findings:
-        if stop_event and stop_event.is_set():
-            broke_early = True
-            break
-        finding_id = persistence.record_finding(cycle_id, finding)
-        t1: CoderTask | None = None
-        t2: CoderTask | None = None
-        ig = None
-        try:
-            # Gate (a) 3-cycle skip
-            if persistence.fix_attempts(finding.bug_id) >= 3:
-                persistence.update_finding(finding_id, "skipped")
-                log.warning("skipping %s — fix_attempts >= 3", finding.bug_id)
-                findings_skipped += 1
-                continue
-            # Gate (b) blocklist
-            if any(fnmatch(p, pat) for p in finding.paths for pat in cfg.blocklist):
-                persistence.update_finding(finding_id, "skipped")
-                log.warning("skipping %s — blocklist hit", finding.bug_id)
-                findings_skipped += 1
-                continue
-
-            # Coder-1
-            persistence.update_finding(finding_id, "fixing-code")
-            t1, _t2_placeholder = build_coder_tasks(finding, prior_diff=None)
-            await wm.acreate(t1.id)
-            ok, c1_cost = await _drive_coder(t1, repo / ".pm-agent-worktrees" / t1.id, cfg.coder_timeout)
-            persistence.record_cost(cycle_id, "coder-1", c1_cost)
-            total_cost += c1_cost
-            if not ok:
-                persistence.update_finding(finding_id, "failed")
-                continue
-            diff_1 = await asyncio.to_thread(wm.diff_against_base, t1.id)
-            if not diff_1.strip():
-                persistence.update_finding(finding_id, "failed")  # NO_CHANGES
-                continue
-
-            # Coder-2 with diff
-            persistence.update_finding(finding_id, "fixing-test")
-            _t1_again, t2 = build_coder_tasks(finding, prior_diff=diff_1)
-            await wm.acreate(t2.id)
-            ok, c2_cost = await _drive_coder(t2, repo / ".pm-agent-worktrees" / t2.id, cfg.coder_timeout)
-            persistence.record_cost(cycle_id, "coder-2", c2_cost)
-            total_cost += c2_cost
-            if not ok:
-                persistence.update_finding(finding_id, "failed")
-                continue
-
-            # Integrate
-            persistence.update_finding(finding_id, "integrating")
-            ig = await wm.aintegrate(
-                f"cycle-{cycle_id}-{finding.bug_id}",
-                [t1.id, t2.id],
-                test_cmd=None,
-                test_timeout=cfg.test_timeout,
-            )
-            if ig.conflicts:
-                persistence.update_finding(finding_id, "failed")
-                continue
-
-            # Gate (c) pytest + mypy + ruff — run against integration worktree
-            persistence.update_finding(finding_id, "testing")
-            gates_green, gate_output = await asyncio.to_thread(run_gates, ig.worktree_path)
-
-            # Route
-            persistence.update_finding(finding_id, "routing")
-            pr_branch = ig.branch
-            if finding.severity in ("Critical", "High"):
-                pr = await github.open_pr(
-                    pr_branch, finding,
-                    body_extras=gate_output if not gates_green else "",
-                )
-            elif gates_green:
-                pr = await github.auto_merge(pr_branch, finding)
-            else:
-                pr = await github.open_pr(pr_branch, finding, body_extras=gate_output)
-            persistence.record_pr(
-                finding_id, pr.number, pr.url, state="open", action=pr.action,
-            )
-            persistence.update_finding(finding_id, "done")
-            findings_fixed += 1
-        except Exception:
-            log.exception("finding %s raised unexpected exception; marking failed", finding.bug_id)
+    def _ensure_finished(status: persistence.CycleStatus) -> None:
+        """Idempotent: only finish_cycle once per cycle."""
+        nonlocal cycle_finished
+        if not cycle_finished:
             try:
-                persistence.update_finding(finding_id, "failed")
+                persistence.finish_cycle(cycle_id, status, total_cost)
             except Exception:
-                pass  # persistence itself broken; finally still runs cleanup
-            findings_skipped += 1  # count as skipped so totals balance
-        finally:
-            # uniform cleanup — spec F4
-            if t1 is not None:
-                try:
-                    await wm.acleanup_worktree(t1.id)
-                    await wm.adelete_branch(t1.id)
-                except Exception:
-                    log.exception("cleanup t1 failed for %s", finding.bug_id)
-            if t2 is not None:
-                try:
-                    await wm.acleanup_worktree(t2.id)
-                    await wm.adelete_branch(t2.id)
-                except Exception:
-                    log.exception("cleanup t2 failed for %s", finding.bug_id)
-            if ig is not None:
-                try:
-                    await wm.acleanup_integration(ig)
-                except Exception:
-                    log.exception("cleanup integration failed for %s", finding.bug_id)
+                log.exception("finish_cycle failed for cycle %s", cycle_id)
+            cycle_finished = True
 
-    if broke_early:
-        cycle_status = "aborted"
-    persistence.finish_cycle(cycle_id, cycle_status, total_cost)
-    return CycleResult(
-        cycle_id=cycle_id,
-        findings_total=findings_total,
-        findings_fixed=findings_fixed,
-        findings_skipped=findings_skipped,
-        cost_usd=total_cost,
-        duration_s=time.time() - t0,
-    )
+    try:
+        if stop_event and stop_event.is_set():
+            _ensure_finished("done")
+            return CycleResult(cycle_id, 0, 0, 0, 0.0, time.time() - t0)
+
+        # 1. sync PR states
+        try:
+            states = await github.sync_pr_states()
+            for s in states:
+                persistence.update_pr_state(s.number, s.state)
+        except github.GhAuthError:
+            log.error("gh auth failure — halting")
+            _ensure_finished("errored")
+            raise
+
+        if stop_event and stop_event.is_set():
+            _ensure_finished("done")
+            return CycleResult(cycle_id, 0, 0, 0, 0.0, time.time() - t0)
+
+        # 2. scan
+        try:
+            findings, scan_cost = await scanner.scan(repo, max_retries=cfg.max_retries)
+            persistence.record_cost(cycle_id, "scanner", scan_cost)
+            total_cost += scan_cost
+        except Exception:
+            log.exception("scanner crashed")
+            _ensure_finished("errored")
+            return CycleResult(cycle_id, 0, 0, 0, total_cost, time.time() - t0)
+
+        findings_total = len(findings)
+        if not findings:
+            _ensure_finished("scan-empty")
+            return CycleResult(cycle_id, 0, 0, 0, total_cost, time.time() - t0)
+
+        wm = WorktreeManager(repo)
+        # 3. per-finding loop
+        for finding in findings:
+            if stop_event and stop_event.is_set():
+                broke_early = True
+                break
+            finding_id = persistence.record_finding(cycle_id, finding)
+            t1: CoderTask | None = None
+            t2: CoderTask | None = None
+            ig = None
+            try:
+                # Gate (a) 3-cycle skip
+                if persistence.fix_attempts(finding.bug_id) >= 3:
+                    persistence.update_finding(finding_id, "skipped")
+                    log.warning("skipping %s — fix_attempts >= 3", finding.bug_id)
+                    findings_skipped += 1
+                    continue
+                # Gate (b) blocklist
+                if any(fnmatch(p, pat) for p in finding.paths for pat in cfg.blocklist):
+                    persistence.update_finding(finding_id, "skipped")
+                    log.warning("skipping %s — blocklist hit", finding.bug_id)
+                    findings_skipped += 1
+                    continue
+
+                # Coder-1
+                persistence.update_finding(finding_id, "fixing-code")
+                t1, _t2_placeholder = build_coder_tasks(finding, prior_diff=None)
+                await wm.acreate(t1.id)
+                ok, c1_cost = await _drive_coder(t1, repo / ".pm-agent-worktrees" / t1.id, cfg.coder_timeout)
+                persistence.record_cost(cycle_id, "coder-1", c1_cost)
+                total_cost += c1_cost
+                if not ok:
+                    persistence.update_finding(finding_id, "failed")
+                    continue
+                diff_1 = await asyncio.to_thread(wm.diff_against_base, t1.id)
+                if not diff_1.strip():
+                    persistence.update_finding(finding_id, "failed")  # NO_CHANGES
+                    continue
+
+                # Coder-2 with diff
+                persistence.update_finding(finding_id, "fixing-test")
+                _t1_again, t2 = build_coder_tasks(finding, prior_diff=diff_1)
+                await wm.acreate(t2.id)
+                ok, c2_cost = await _drive_coder(t2, repo / ".pm-agent-worktrees" / t2.id, cfg.coder_timeout)
+                persistence.record_cost(cycle_id, "coder-2", c2_cost)
+                total_cost += c2_cost
+                if not ok:
+                    persistence.update_finding(finding_id, "failed")
+                    continue
+
+                # Integrate
+                persistence.update_finding(finding_id, "integrating")
+                ig = await wm.aintegrate(
+                    f"cycle-{cycle_id}-{finding.bug_id}",
+                    [t1.id, t2.id],
+                    test_cmd=None,
+                    test_timeout=cfg.test_timeout,
+                )
+                if ig.conflicts:
+                    persistence.update_finding(finding_id, "failed")
+                    continue
+
+                # Gate (c) pytest + mypy + ruff — run against integration worktree
+                persistence.update_finding(finding_id, "testing")
+                gates_green, gate_output = await asyncio.to_thread(run_gates, ig.worktree_path)
+
+                # Route
+                persistence.update_finding(finding_id, "routing")
+                pr_branch = ig.branch
+                if finding.severity in ("Critical", "High"):
+                    pr = await github.open_pr(
+                        pr_branch, finding,
+                        body_extras=gate_output if not gates_green else "",
+                    )
+                elif gates_green:
+                    pr = await github.auto_merge(pr_branch, finding)
+                else:
+                    pr = await github.open_pr(pr_branch, finding, body_extras=gate_output)
+                persistence.record_pr(
+                    finding_id, pr.number, pr.url, state="open", action=pr.action,
+                )
+                persistence.update_finding(finding_id, "done")
+                findings_fixed += 1
+            except Exception:
+                log.exception("finding %s raised unexpected exception; marking failed", finding.bug_id)
+                try:
+                    persistence.update_finding(finding_id, "failed")
+                except Exception:
+                    pass  # persistence itself broken; finally still runs cleanup
+                findings_skipped += 1  # count as skipped so totals balance
+            finally:
+                # uniform cleanup — spec F4
+                if t1 is not None:
+                    try:
+                        await wm.acleanup_worktree(t1.id)
+                        await wm.adelete_branch(t1.id)
+                    except Exception:
+                        log.exception("cleanup t1 failed for %s", finding.bug_id)
+                if t2 is not None:
+                    try:
+                        await wm.acleanup_worktree(t2.id)
+                        await wm.adelete_branch(t2.id)
+                    except Exception:
+                        log.exception("cleanup t2 failed for %s", finding.bug_id)
+                if ig is not None:
+                    try:
+                        await wm.acleanup_integration(ig)
+                    except Exception:
+                        log.exception("cleanup integration failed for %s", finding.bug_id)
+
+        if broke_early:
+            cycle_status = "aborted"
+        _ensure_finished(cycle_status)
+        return CycleResult(
+            cycle_id=cycle_id,
+            findings_total=findings_total,
+            findings_fixed=findings_fixed,
+            findings_skipped=findings_skipped,
+            cost_usd=total_cost,
+            duration_s=time.time() - t0,
+        )
+    except asyncio.CancelledError:
+        # spec §5.2 / F3: cancellation must finish_cycle before propagating
+        _ensure_finished("aborted")
+        raise  # re-raise so caller sees cancellation
+    finally:
+        # Defensive: any other path that exited without finish_cycle
+        _ensure_finished("aborted")
 
 
 async def run_forever(repo: Path, cfg: LoopConfig | None = None) -> None:

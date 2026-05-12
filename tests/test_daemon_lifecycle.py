@@ -40,71 +40,72 @@ async def _fake_sync_pr():
 def test_daemon_startup_with_empty_db(tmp_path, monkeypatch):
     """Fresh init: reconciler runs against empty DB; daemon starts;
     one cycle completes (scanner returns 0 findings → scan-empty);
-    daemon cancellable."""
+    daemon cancellable. No zombie 'running' rows on shutdown."""
     monkeypatch.setenv("HOME", str(tmp_path))
-    # Redirect the module-level STATE_DB so run_forever uses tmp_path.
     monkeypatch.setattr(pm_agent.loop, "STATE_DB", tmp_path / ".pm-agent" / "state.db")
-    # Monkeypatch run_gates to avoid launching real uv-pytest.
-    monkeypatch.setattr(pm_agent.loop, "run_gates", lambda repo: (True, ""))
-    # Monkeypatch sync_pr_states to return immediately (real gh subprocess ~1.7s).
-    monkeypatch.setattr("pm_agent.loop.github.sync_pr_states", lambda: _fake_sync_pr())
+
+    # Deterministic timing: mock both heavy operations
+    async def _fast_sync_pr():
+        return []
+    async def _empty_scan(*args, **kwargs):
+        return [], 0.0
+    monkeypatch.setattr("pm_agent.loop.github.sync_pr_states", _fast_sync_pr)
+    monkeypatch.setattr("pm_agent.loop.scanner.scan", _empty_scan)
 
     with fake_repo() as repo:
-        with gh_shim(responses={"pr list": "[]"}):
-            with claude_shim(events=_empty_scanner_events()):
-                async def main():
-                    cfg = LoopConfig(interval_s=60)  # long interval so daemon waits
-                    task = asyncio.create_task(run_forever(repo, cfg))
-                    # Wait long enough for the first cycle to complete before
-                    # cancelling. scan subprocess startup can take ~1-2s.
-                    await asyncio.sleep(3.0)
-                    task.cancel()
-                    try:
-                        await asyncio.wait_for(task, timeout=5.0)
-                    except (asyncio.CancelledError, asyncio.TimeoutError):
-                        pass
-                asyncio.run(main())
+        async def main():
+            cfg = LoopConfig(interval_s=60)  # don't start a 2nd cycle
+            task = asyncio.create_task(run_forever(repo, cfg))
+            await asyncio.sleep(0.5)  # let one scan-empty cycle complete
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=3.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        asyncio.run(main())
+
     # State DB created
     db = tmp_path / ".pm-agent" / "state.db"
     assert db.exists()
-    # At least one cycle row exists; none should be left as 'running'
+    # No zombie 'running' rows
     persistence.init_db(db)
-    rows = persistence.get_conn().execute(
-        "SELECT status FROM cycles",
-    ).fetchall()
+    rows = persistence.get_conn().execute("SELECT status FROM cycles").fetchall()
     assert rows, "no cycle row recorded"
     assert all(r["status"] != "running" for r in rows), \
         f"zombie 'running' cycle detected: {[r['status'] for r in rows]}"
 
 
 def test_daemon_sigterm_grace(tmp_path, monkeypatch):
-    """Daemon cancellation mid-cycle → daemon exits within 5s.
-
-    Uses task.cancel() instead of os.kill(SIGTERM) — same effect on the
-    daemon's exit path (CancelledError propagates through asyncio.run)
-    but doesn't risk killing pytest itself if the event loop hasn't yet
-    installed the signal handler.
-    """
+    """task.cancel() during cycle → daemon exits within 5s + no zombie row."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(pm_agent.loop, "STATE_DB", tmp_path / ".pm-agent" / "state.db")
-    monkeypatch.setattr(pm_agent.loop, "run_gates", lambda repo: (True, ""))
-    # Monkeypatch sync_pr_states to return immediately (real gh subprocess ~1.7s).
-    monkeypatch.setattr("pm_agent.loop.github.sync_pr_states", lambda: _fake_sync_pr())
+
+    async def _fast_sync_pr():
+        return []
+    async def _empty_scan(*args, **kwargs):
+        return [], 0.0
+    monkeypatch.setattr("pm_agent.loop.github.sync_pr_states", _fast_sync_pr)
+    monkeypatch.setattr("pm_agent.loop.scanner.scan", _empty_scan)
 
     with fake_repo() as repo:
-        with gh_shim(responses={"pr list": "[]"}):
-            with claude_shim(events=_empty_scanner_events()):
-                async def main():
-                    cfg = LoopConfig(interval_s=1)
-                    task = asyncio.create_task(run_forever(repo, cfg))
-                    await asyncio.sleep(0.3)
-                    task.cancel()
-                    # Must complete within 5s — worst case one finding round
-                    try:
-                        await asyncio.wait_for(task, timeout=5.0)
-                    except (asyncio.CancelledError, asyncio.TimeoutError):
-                        pass
-                asyncio.run(main())
+        async def main():
+            cfg = LoopConfig(interval_s=60)
+            task = asyncio.create_task(run_forever(repo, cfg))
+            await asyncio.sleep(0.2)
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        asyncio.run(main())
+
+    # Verify no zombie running cycles
+    db = tmp_path / ".pm-agent" / "state.db"
+    if db.exists():
+        persistence.init_db(db)
+        rows = persistence.get_conn().execute("SELECT status FROM cycles").fetchall()
+        assert all(r["status"] != "running" for r in rows), \
+            f"zombie 'running' cycle detected after cancel: {[r['status'] for r in rows]}"
 
 
 def test_daemon_survives_scanner_crash(tmp_path, monkeypatch):
@@ -159,15 +160,20 @@ def test_daemon_halts_on_gh_auth_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(pm_agent.loop, "STATE_DB", tmp_path / ".pm-agent" / "state.db")
     monkeypatch.setattr(pm_agent.loop, "run_gates", lambda repo: (True, ""))
 
+    # Mock scan for consistency (auth check fires before scan but mock prevents
+    # any race if auth path unexpectedly proceeds further)
+    async def _empty_scan(*args, **kwargs):
+        return [], 0.0
+    monkeypatch.setattr("pm_agent.loop.scanner.scan", _empty_scan)
+
     with fake_repo() as repo:
         with gh_shim(auth_failure=True):
-            with claude_shim(events=_empty_scanner_events()):
-                async def main():
-                    cfg = LoopConfig(interval_s=1)
-                    # run_forever should return cleanly on GhAuthError
-                    # within one cycle attempt — wrap in wait_for for safety
-                    try:
-                        await asyncio.wait_for(run_forever(repo, cfg), timeout=10.0)
-                    except asyncio.TimeoutError:
-                        pytest.fail("daemon did not halt on gh auth failure within 10s")
-                asyncio.run(main())
+            async def main():
+                cfg = LoopConfig(interval_s=1)
+                # run_forever should return cleanly on GhAuthError
+                # within one cycle attempt — wrap in wait_for for safety
+                try:
+                    await asyncio.wait_for(run_forever(repo, cfg), timeout=10.0)
+                except asyncio.TimeoutError:
+                    pytest.fail("daemon did not halt on gh auth failure within 10s")
+            asyncio.run(main())
