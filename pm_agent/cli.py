@@ -19,6 +19,77 @@ import sys
 from pathlib import Path
 
 
+# ---- argparse type validators (R3-A-01 / R3-C-07) ----
+# Silently accepting ≤0 lets `--interval-s 0` hot-loop the API endlessly
+# until the budget is exhausted. The minima below are chosen to prevent
+# that class of mistake while still allowing aggressive dev configs.
+
+def _interval_s_type(raw: str) -> int:
+    try:
+        v = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--interval-s must be an integer, got {raw!r}",
+        ) from exc
+    if v < 60:
+        raise argparse.ArgumentTypeError(
+            f"--interval-s must be >= 60 (1 minute); got {v}. "
+            "Smaller intervals hot-loop the API and exhaust budget.",
+        )
+    return v
+
+
+def _coder_timeout_type(raw: str) -> float:
+    try:
+        v = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--coder-timeout must be a number, got {raw!r}",
+        ) from exc
+    if v < 30:
+        raise argparse.ArgumentTypeError(
+            f"--coder-timeout must be >= 30 seconds; got {v}",
+        )
+    return v
+
+
+def _test_timeout_type(raw: str) -> float:
+    try:
+        v = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--test-timeout must be a number, got {raw!r}",
+        ) from exc
+    if v < 30:
+        raise argparse.ArgumentTypeError(
+            f"--test-timeout must be >= 30 seconds; got {v}",
+        )
+    return v
+
+
+def _nonneg_int_type(raw: str) -> int:
+    try:
+        v = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"value must be an integer, got {raw!r}",
+        ) from exc
+    if v < 0:
+        raise argparse.ArgumentTypeError(
+            f"value must be >= 0 (0 = never retry); got {v}",
+        )
+    return v
+
+
+def _path_expanduser(raw: str) -> Path:
+    """Path argument that expands ~ to $HOME (R3-C-05).
+
+    Plain `type=Path` happily produces Path('~/foo'), which later code
+    treats as a literal directory in CWD.
+    """
+    return Path(raw).expanduser()
+
+
 def cmd_loop_run(args: argparse.Namespace) -> int:
     from pm_agent.loop import run_forever, LoopConfig
     # INFO logs from loop.py give the operator visibility during the 14h run.
@@ -33,6 +104,10 @@ def cmd_loop_run(args: argparse.Namespace) -> int:
         coder_timeout=args.coder_timeout,
         test_timeout=args.test_timeout,
     )
+    # R3-C-04: only return 130 when the user actually interrupted us. Clean
+    # shutdown (run_forever's signal handler set stop_event and the loop
+    # exited normally) and GhAuthError-driven termination both count as
+    # graceful → exit 0.
     try:
         asyncio.run(run_forever(args.repo, cfg))
     except KeyboardInterrupt:
@@ -40,11 +115,7 @@ def cmd_loop_run(args: argparse.Namespace) -> int:
         # instead of run_forever's signal handler. Cover both paths.
         print("interrupted", file=sys.stderr)
         return 130
-    # Normal path: run_forever's signal handler set stop_event; the daemon
-    # exited cleanly. Treat any return as signal-driven (the loop has no
-    # other exit besides GhAuthError which propagates).
-    print("interrupted", file=sys.stderr)
-    return 130
+    return 0
 
 
 def cmd_loop_preflight(args: argparse.Namespace) -> int:
@@ -94,6 +165,16 @@ def cmd_loop_status(args: argparse.Namespace) -> int:
 
 def cmd_dashboard_serve(args: argparse.Namespace) -> int:
     import uvicorn
+    from pm_agent import persistence
+    from pm_agent.loop import STATE_DB
+    # R3-C-06: When the dashboard runs as a separate process from the daemon
+    # (the documented "open the dashboard in another terminal" flow), its
+    # persistence module never had init_db() called, so get_conn() raises
+    # RuntimeError on every request. The endpoint masks that with
+    # `except RuntimeError → status='idle'`, so the dashboard reads "idle"
+    # forever even while the daemon happily writes cycles. init_db is
+    # idempotent — safe to call even if the daemon has already initialised it.
+    persistence.init_db(STATE_DB)
     uvicorn.run(
         "pm_agent.dashboard.server:app",
         host=args.host, port=args.port, reload=False,
@@ -121,25 +202,28 @@ def _build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser, a
     p_loop = sub.add_parser("loop", help="autonomous loop daemon")
     sub_loop = p_loop.add_subparsers(dest="loop_cmd", metavar="LOOP_CMD")
     p_loop_run = sub_loop.add_parser("run", help="start daemon")
-    p_loop_run.add_argument("--repo", type=Path, default=Path.cwd())
-    p_loop_run.add_argument("--interval-s", type=int, default=1800,
-                            help="cycle interval in seconds (default: 1800)")
-    p_loop_run.add_argument("--max-retries", type=int, default=2)
-    p_loop_run.add_argument("--coder-timeout", type=float, default=180.0)
-    p_loop_run.add_argument("--test-timeout", type=float, default=120.0)
+    p_loop_run.add_argument("--repo", type=_path_expanduser, default=Path.cwd())
+    p_loop_run.add_argument("--interval-s", type=_interval_s_type, default=1800,
+                            help="cycle interval in seconds (min 60, default: 1800)")
+    p_loop_run.add_argument("--max-retries", type=_nonneg_int_type, default=2,
+                            help="retries per finding (0 = never retry, default: 2)")
+    p_loop_run.add_argument("--coder-timeout", type=_coder_timeout_type, default=180.0,
+                            help="coder subprocess timeout in seconds (min 30, default: 180)")
+    p_loop_run.add_argument("--test-timeout", type=_test_timeout_type, default=120.0,
+                            help="test subprocess timeout in seconds (min 30, default: 120)")
     sub_loop.add_parser("status", help="show current running cycle")
     p_preflight = sub_loop.add_parser(
         "preflight", help="30s readiness check before a dry run"
     )
     p_preflight.add_argument(
-        "--repo", type=Path, default=Path.cwd(),
+        "--repo", type=_path_expanduser, default=Path.cwd(),
         help="target git repo to check (default: cwd)",
     )
     p_report = sub_loop.add_parser(
         "report", help="summarise state.db after a dry run"
     )
     p_report.add_argument(
-        "--db", type=Path, default=None,
+        "--db", type=_path_expanduser, default=None,
         help="path to state.db (default: ~/.pm-agent/state.db)",
     )
 
