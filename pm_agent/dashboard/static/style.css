@@ -1,0 +1,12 @@
+* { box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; padding: 1em 2em; background: #fafafa; color: #222; }
+header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #ddd; padding-bottom: 0.5em; margin-bottom: 1em; }
+header h1 { font-size: 1.4em; margin: 0; }
+#cumulative-cost { font-size: 1.1em; }
+.cost-ok { color: #2e7d32; font-weight: bold; }
+.cost-warn { color: #c62828; font-weight: bold; background: #ffebee; padding: 2px 8px; border-radius: 4px; }
+section { background: white; padding: 1em; margin-bottom: 1em; border: 1px solid #e0e0e0; border-radius: 4px; }
+section h2 { margin-top: 0; font-size: 1.1em; }
+canvas { max-width: 100%; border: 1px solid #eee; }
+ul { margin: 0; padding-left: 1.4em; }
+.idle { color: #888; font-style: italic; }

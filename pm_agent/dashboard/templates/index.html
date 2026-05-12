@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>pm-agent · autonomous loop</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://unpkg.com/htmx.org@2.0.3"></script>
+</head>
+<body>
+  <header>
+    <h1>pm-agent autonomous loop</h1>
+    <div id="cumulative-cost"
+         hx-get="/api/trend" hx-trigger="load, every 30s" hx-swap="none"
+         hx-on::after-request="
+           const data = JSON.parse(event.detail.xhr.responseText);
+           const last = data.points[data.points.length - 1];
+           const cost = last ? last.cumulative_cost_usd : 0;
+           const banner = document.getElementById('cumulative-cost-display');
+           banner.textContent = '$' + cost.toFixed(2);
+           banner.className = cost > 50 ? 'cost-warn' : 'cost-ok';
+         ">
+      Cumulative cost: <span id="cumulative-cost-display" class="cost-ok">$0.00</span>
+    </div>
+  </header>
+
+  <section id="live-cycle"
+           hx-get="/api/live" hx-trigger="load, every 1s"
+           hx-swap="none"
+           hx-on::after-request="renderLive(JSON.parse(event.detail.xhr.responseText))">
+    <h2>Live Cycle</h2>
+    <div id="live-cycle-body">Loading…</div>
+  </section>
+
+  <section id="trend-chart"
+           hx-get="/api/trend" hx-trigger="load, every 30s"
+           hx-swap="none"
+           hx-on::after-request="renderChart(JSON.parse(event.detail.xhr.responseText))">
+    <h2>24-hour trend</h2>
+    <canvas id="trend-canvas" width="800" height="240"></canvas>
+  </section>
+
+  <script>
+    function renderLive(data) {
+      const body = document.getElementById('live-cycle-body');
+      if (!data.cycle) {
+        body.innerHTML = '<p class="idle">No running cycle — daemon idle.</p>';
+        return;
+      }
+      const c = data.cycle;
+      const findings = (data.findings || []).map(f =>
+        `<li><b>${f.bug_id}</b> [${f.severity}] — ${f.status} — ${f.title}</li>`
+      ).join('');
+      body.innerHTML = `
+        <p><b>Cycle ${c.id}</b> · status: ${c.status} · started ${c.started_at}</p>
+        <p>Findings: ${c.findings_total} · Cost: $${c.cost_usd.toFixed(4)}</p>
+        <ul>${findings || '<li><i>no findings yet</i></li>'}</ul>
+      `;
+    }
+
+    function renderChart(data) {
+      const canvas = document.getElementById('trend-canvas');
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const pts = data.points || [];
+      if (pts.length === 0) {
+        ctx.fillStyle = '#888';
+        ctx.font = '14px sans-serif';
+        ctx.fillText('No cycles in the last 24h', 20, 30);
+        return;
+      }
+      const maxCost = Math.max(...pts.map(p => p.cumulative_cost_usd), 0.01);
+      const maxF = Math.max(...pts.map(p => p.findings_total), 1);
+      const w = canvas.width, h = canvas.height;
+      const dx = w / pts.length;
+      // findings bars (background, semi-transparent green)
+      ctx.fillStyle = 'rgba(76,175,80,0.4)';
+      pts.forEach((p, i) => {
+        const x = i * dx + 2;
+        const barH = (p.findings_total / maxF) * (h - 30);
+        ctx.fillRect(x, h - barH, Math.max(dx - 4, 2), barH);
+      });
+      // cumulative cost line (foreground, blue)
+      ctx.strokeStyle = '#2196F3';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      pts.forEach((p, i) => {
+        const x = i * dx + dx/2;
+        const y = h - (p.cumulative_cost_usd / maxCost) * (h - 20);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
+  </script>
+</body>
+</html>
