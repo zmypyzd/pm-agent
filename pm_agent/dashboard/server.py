@@ -87,11 +87,20 @@ def create_app() -> FastAPI:
             n_findings = c.execute(
                 "SELECT COUNT(*) AS n FROM findings WHERE cycle_id=?", (row["id"],),
             ).fetchone()["n"]
+            # R3-C-01: cycles.cost_usd is only written by finish_cycle(), so it's
+            # 0 during a running cycle. Sum live from the costs table instead so
+            # the Live Cycle panel reflects actual spend during long unattended runs.
+            live_cost = c.execute(
+                "SELECT COALESCE(SUM(usd), 0) AS total FROM costs WHERE cycle_id=?",
+                (row["id"],),
+            ).fetchone()["total"]
             # LIMIT 50: spec scenario is ~5 findings/cycle; 50 is a safe ceiling
             # that bounds JSON payload size even for unexpectedly large cycles.
+            # R3-C-03: ORDER BY id DESC so operators see freshest findings first
+            # (previously ASC → with >50 findings the newest were invisible).
             findings_rows = c.execute(
                 """SELECT bug_id, title, severity, status FROM findings
-                   WHERE cycle_id=? ORDER BY id LIMIT 50""",
+                   WHERE cycle_id=? ORDER BY id DESC LIMIT 50""",
                 (row["id"],),
             ).fetchall()
             findings_list = [
@@ -104,7 +113,7 @@ def create_app() -> FastAPI:
             return LiveCycleResponse(
                 cycle=CycleSummary(
                     id=row["id"], status=row["status"], started_at=row["started_at"],
-                    finished_at=row["finished_at"], cost_usd=row["cost_usd"],
+                    finished_at=row["finished_at"], cost_usd=float(live_cost),
                     findings_total=n_findings,
                 ),
                 status="running",
@@ -132,7 +141,15 @@ def create_app() -> FastAPI:
             cumulative = 0.0
             points: list[TrendPoint] = []
             for row in cycles:
-                cumulative += float(row["cost_usd"] or 0)
+                # R3-C-02: cycles.cost_usd is 0 until finish_cycle() runs, so
+                # the cumulative banner under-reported during a live cycle. Sum
+                # from the costs table per cycle so the red-warning threshold
+                # ($50) trips on real-time spend, not stale completed-cycle data.
+                cost_row = c.execute(
+                    "SELECT COALESCE(SUM(usd), 0) AS total FROM costs WHERE cycle_id=?",
+                    (row["id"],),
+                ).fetchone()
+                cumulative += float(cost_row["total"] or 0)
                 findings_n = c.execute(
                     "SELECT COUNT(*) AS n FROM findings WHERE cycle_id=?", (row["id"],),
                 ).fetchone()["n"]
