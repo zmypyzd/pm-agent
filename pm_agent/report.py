@@ -158,7 +158,12 @@ def _gather(conn: sqlite3.Connection) -> dict:  # type: ignore[type-arg]
             ).fetchall()
             cost_map = {r["agent"]: r["total"] for r in cost_rows}
             data["cost_scanner"] = cost_map.get("scanner")
-            data["cost_coder"] = cost_map.get("coder")
+            # BUG-R4-2: the cycle loop writes per-coder rows with agent
+            # names "coder-1" and "coder-2" (see pm_agent.loop calls to
+            # record_cost), not the literal "coder". Aggregate any key
+            # whose name starts with "coder" so the report adds them all.
+            coder_totals = [v for k, v in cost_map.items() if k.startswith("coder")]
+            data["cost_coder"] = sum(coder_totals) if coder_totals else None
         else:
             data["cost_scanner"] = None
             data["cost_coder"] = None

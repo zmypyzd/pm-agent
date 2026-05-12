@@ -254,6 +254,37 @@ class TestMissingCostColumn:
         out = _capture_report(db)
         assert "N/A" in out
 
+    def test_coder_cost_aggregates_coder_1_and_coder_2(self, tmp_path: Path) -> None:
+        """BUG-R4-2: real loop writes per-coder rows with agent='coder-1'/'coder-2'.
+
+        Before fix: report.py looked for the literal agent='coder' and missed
+        them, so cost_coder was always None and total under-reported. After
+        fix: any agent name starting with 'coder' is summed.
+        """
+        db = tmp_path / "state.db"
+        c = _init_full_schema(db)
+        c.execute(
+            "INSERT INTO cycles (id, started_at, finished_at, status) VALUES "
+            "(1, '2024-01-01T00:00:00', '2024-01-01T01:00:00', 'done')"
+        )
+        c.executemany(
+            "INSERT INTO costs (cycle_id, agent, usd, at) VALUES (?, ?, ?, ?)",
+            [
+                (1, "scanner", 0.10, "2024-01-01T00:01:00"),
+                (1, "coder-1", 1.20, "2024-01-01T00:05:00"),
+                (1, "coder-2", 0.80, "2024-01-01T00:10:00"),
+            ],
+        )
+        c.commit()
+        c.close()
+        out = _capture_report(db)
+        assert "$0.10" in out, "scanner cost missing"
+        assert "$2.00" in out, "coder cost should be sum(coder-1, coder-2) = 2.00"
+        assert "$2.10" in out, "total = scanner + coders"
+        assert "N/A" not in out.split("Costs (USD):", 1)[1], (
+            "coder cost should not be N/A when coder-1/coder-2 rows exist"
+        )
+
     def test_running_cycle_shows_zombie_note(self, tmp_path: Path) -> None:
         """A 'running' cycle should show the zombie warning note."""
         db = tmp_path / "state.db"
