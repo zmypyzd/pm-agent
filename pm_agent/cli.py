@@ -12,12 +12,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
 from pathlib import Path
 
 
 def cmd_loop_run(args: argparse.Namespace) -> int:
     from pm_agent.loop import run_forever, LoopConfig
+    # INFO logs from loop.py give the operator visibility during the 14h run.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+    )
     cfg = LoopConfig(
         interval_s=args.interval_s,
         max_retries=args.max_retries,
@@ -27,14 +34,21 @@ def cmd_loop_run(args: argparse.Namespace) -> int:
     try:
         asyncio.run(run_forever(args.repo, cfg))
     except KeyboardInterrupt:
+        # Some platforms / older asyncio: outer KeyboardInterrupt fires
+        # instead of run_forever's signal handler. Cover both paths.
         print("interrupted", file=sys.stderr)
         return 130
-    return 0
+    # Normal path: run_forever's signal handler set stop_event; the daemon
+    # exited cleanly. Treat any return as signal-driven (the loop has no
+    # other exit besides GhAuthError which propagates).
+    print("interrupted", file=sys.stderr)
+    return 130
 
 
 def cmd_loop_status(args: argparse.Namespace) -> int:
     from pm_agent import persistence
-    state_db = Path.home() / ".pm-agent" / "state.db"
+    from pm_agent.loop import STATE_DB
+    state_db = STATE_DB
     if not state_db.exists():
         print("no running cycle (state.db not initialized)")
         return 0
@@ -62,13 +76,17 @@ def cmd_dashboard_serve(args: argparse.Namespace) -> int:
 
 def cmd_tui(args: argparse.Namespace) -> int:
     from pm_agent.tui import main as tui_main
-    # Re-build sys.argv so tui's own argparse sees only its args
+    old_argv = sys.argv
     sys.argv = ["pm-agent"] + list(args.tui_args or [])
-    tui_main()
+    try:
+        tui_main()
+    finally:
+        sys.argv = old_argv
     return 0
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser, argparse.ArgumentParser]:
+    """Return (root_parser, loop_subparser, dashboard_subparser)."""
     ap = argparse.ArgumentParser(prog="pm-agent")
     sub = ap.add_subparsers(dest="cmd", metavar="COMMAND")
 
@@ -96,11 +114,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_tui.add_argument("tui_args", nargs=argparse.REMAINDER,
                        help="args passed through to pm_agent.tui")
 
-    return ap
+    return ap, p_loop, p_dash
 
 
 def main() -> int:
-    ap = _build_parser()
+    ap, p_loop, p_dash = _build_parser()
     args = ap.parse_args()
     if args.cmd is None:
         # back-compat: pm-agent with no subcommand → TUI
@@ -112,12 +130,12 @@ def main() -> int:
             return cmd_loop_run(args)
         if args.loop_cmd == "status":
             return cmd_loop_status(args)
-        ap.print_help()
+        p_loop.print_help()  # bare 'pm-agent loop' shows loop's help
         return 2
     if args.cmd == "dashboard":
         if args.dash_cmd == "serve":
             return cmd_dashboard_serve(args)
-        ap.print_help()
+        p_dash.print_help()  # bare 'pm-agent dashboard' shows dashboard's help
         return 2
     if args.cmd == "tui":
         return cmd_tui(args)

@@ -25,6 +25,8 @@ from pm_agent.worktree import WorktreeManager
 
 log = logging.getLogger(__name__)
 
+STATE_DB: Path = Path.home() / ".pm-agent" / "state.db"
+
 
 @dataclass
 class CycleResult:
@@ -375,7 +377,7 @@ async def run_one_cycle(
 async def run_forever(repo: Path, cfg: LoopConfig | None = None) -> None:
     """Daemon entry point. Installs SIGINT/SIGTERM handlers; loops cycles."""
     cfg = cfg or LoopConfig()
-    state_db = Path.home() / ".pm-agent" / "state.db"
+    state_db = STATE_DB
     persistence.init_db(state_db)
     report = persistence.reconcile(repo)
     log.info("reconcile: %s", report)

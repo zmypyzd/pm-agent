@@ -5,8 +5,6 @@ import sys
 from io import StringIO
 from unittest.mock import patch
 
-import pytest
-
 from pm_agent.cli import main
 
 
@@ -23,13 +21,10 @@ def _run_cli(argv: list[str]) -> tuple[int, str, str]:
     return rc, out.getvalue(), err.getvalue()
 
 
-def test_help_lists_subcommands(capsys):
+def test_help_lists_subcommands():
     """pm-agent --help shows loop / dashboard / tui subcommands."""
-    with patch.object(sys, "argv", ["pm-agent", "--help"]):
-        with pytest.raises(SystemExit):
-            main()
-    captured = capsys.readouterr()
-    text = captured.out + captured.err
+    rc, out, err = _run_cli(["--help"])
+    text = out + err
     assert "loop" in text
     assert "dashboard" in text
 
@@ -46,3 +41,12 @@ def test_unknown_subcommand_exits_nonzero():
     """Unknown subcommand should exit 2 (argparse convention)."""
     rc, _out, _err = _run_cli(["bogus-cmd"])
     assert rc != 0
+
+
+def test_loop_bare_shows_loop_help_exits_2():
+    """pm-agent loop (no nested cmd) prints loop's help + exits 2."""
+    rc, out, err = _run_cli(["loop"])
+    text = out + err
+    assert rc == 2
+    # loop's help should mention 'run' or 'status' subcommands
+    assert "run" in text or "status" in text
