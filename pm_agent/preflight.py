@@ -141,8 +141,14 @@ def check_claude_cli(timeout: float = 5.0) -> CheckResult:
     )
 
 
-def check_gh_auth(timeout: float = 5.0) -> CheckResult:
-    """``gh auth status`` exits 0 within *timeout* seconds."""
+def check_gh_auth(timeout: float = 15.0) -> CheckResult:
+    """``gh auth status`` exits 0 within *timeout* seconds.
+
+    Default is 15s, not the 5s used elsewhere: on macOS, the first call
+    after login can block on Keychain unlock for 5-10s. A tighter
+    timeout produces false FAILs that scare operators away from
+    launching dry-runs.
+    """
     try:
         result = subprocess.run(
             ["gh", "auth", "status"],
@@ -292,7 +298,7 @@ def run_preflight(
         check_state_db_dir(state_db),
         check_state_db_clean(state_db),
         check_claude_cli(timeout=subprocess_timeout),
-        check_gh_auth(timeout=subprocess_timeout),
+        check_gh_auth(timeout=max(subprocess_timeout, 15.0)),
         check_repo_clean(repo, timeout=subprocess_timeout),
         check_repo_on_main(repo, timeout=subprocess_timeout),
         check_tmp_writable(),
