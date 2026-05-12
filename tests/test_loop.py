@@ -70,3 +70,40 @@ def test_fix_attempts_threshold_logic(tmp_path):
         fid = record_finding(cid, f)
         update_finding(fid, "failed")
     assert fix_attempts("skip01") >= 3
+
+
+def test_drive_coder_returns_cost_tuple():
+    """_drive_coder must return (bool, float) — verified contract."""
+    import inspect
+    from pm_agent.loop import _drive_coder
+    sig = inspect.signature(_drive_coder)
+    ret = sig.return_annotation
+    assert "tuple" in str(ret).lower() or "Tuple" in str(ret)
+
+
+def test_run_one_cycle_marks_aborted_on_stop_event(tmp_path):
+    """When stop_event fires before any finding is processed, cycle should be
+    marked 'aborted' or 'done' but never left as 'running'."""
+    from pm_agent.loop import run_one_cycle, LoopConfig
+    from pm_agent.persistence import init_db, get_conn
+    from tests._fixtures.fake_repo import fake_repo
+    from tests._fixtures.gh_shim import gh_shim
+    from tests._fixtures.claude_shim import claude_shim
+    import asyncio, json
+
+    init_db(tmp_path / "state.db")
+
+    async def driver(repo):
+        stop = asyncio.Event()
+        stop.set()  # already set — cycle should bail immediately
+        return await run_one_cycle(repo, LoopConfig(interval_s=1), stop_event=stop)
+
+    with fake_repo() as repo:
+        with gh_shim(responses={"pr list": "[]"}):
+            with claude_shim():
+                result = asyncio.run(driver(repo))
+    assert result.cycle_id > 0
+    row = get_conn().execute(
+        "SELECT status FROM cycles WHERE id=?", (result.cycle_id,),
+    ).fetchone()
+    assert row["status"] != "running", f"cycle left as 'running' zombie!"

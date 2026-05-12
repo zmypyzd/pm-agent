@@ -182,21 +182,24 @@ def run_gates(repo: Path) -> tuple[bool, str]:
     return False, "\n\n".join(parts)
 
 
-async def _drive_coder(task: CoderTask, wt_path: Path, timeout: float) -> bool:
-    """Run claude in wt_path; return True on clean exit, False on error."""
+async def _drive_coder(task: CoderTask, wt_path: Path, timeout: float) -> tuple[bool, float]:
+    """Run claude in wt_path; return (clean_exit, cost_usd)."""
     from pm_agent.tui import CODER_COMMIT_SUFFIX
     full_prompt = task.prompt + CODER_COMMIT_SUFFIX.format(task_id=task.id)
     saw_error = False
+    cost = 0.0
     async for ev in run_claude_async(
         full_prompt, cwd=str(wt_path), unrestricted=True, timeout=timeout,
     ):
         et = ev.get("type")
         st = ev.get("subtype")
-        if et == "result" and ev.get("is_error"):
-            saw_error = True
+        if et == "result":
+            cost += float(ev.get("total_cost_usd") or 0.0)
+            if ev.get("is_error"):
+                saw_error = True
         elif et == "system" and st in ("timeout", "spawn_error"):
             saw_error = True
-    return not saw_error
+    return (not saw_error), cost
 
 
 async def run_one_cycle(
@@ -210,6 +213,7 @@ async def run_one_cycle(
     cycle_id = persistence.start_cycle()
     total_cost = 0.0
     findings_total = findings_fixed = findings_skipped = 0
+    broke_early = False
     cycle_status: persistence.CycleStatus = "done"
 
     if stop_event and stop_event.is_set():
@@ -249,10 +253,12 @@ async def run_one_cycle(
     # 3. per-finding loop
     for finding in findings:
         if stop_event and stop_event.is_set():
+            broke_early = True
             break
         finding_id = persistence.record_finding(cycle_id, finding)
         t1: CoderTask | None = None
         t2: CoderTask | None = None
+        ig = None
         try:
             # Gate (a) 3-cycle skip
             if persistence.fix_attempts(finding.bug_id) >= 3:
@@ -271,7 +277,9 @@ async def run_one_cycle(
             persistence.update_finding(finding_id, "fixing-code")
             t1, _t2_placeholder = build_coder_tasks(finding, prior_diff=None)
             await wm.acreate(t1.id)
-            ok = await _drive_coder(t1, repo / ".pm-agent-worktrees" / t1.id, cfg.coder_timeout)
+            ok, c1_cost = await _drive_coder(t1, repo / ".pm-agent-worktrees" / t1.id, cfg.coder_timeout)
+            persistence.record_cost(cycle_id, "coder-1", c1_cost)
+            total_cost += c1_cost
             if not ok:
                 persistence.update_finding(finding_id, "failed")
                 continue
@@ -284,7 +292,9 @@ async def run_one_cycle(
             persistence.update_finding(finding_id, "fixing-test")
             _t1_again, t2 = build_coder_tasks(finding, prior_diff=diff_1)
             await wm.acreate(t2.id)
-            ok = await _drive_coder(t2, repo / ".pm-agent-worktrees" / t2.id, cfg.coder_timeout)
+            ok, c2_cost = await _drive_coder(t2, repo / ".pm-agent-worktrees" / t2.id, cfg.coder_timeout)
+            persistence.record_cost(cycle_id, "coder-2", c2_cost)
+            total_cost += c2_cost
             if not ok:
                 persistence.update_finding(finding_id, "failed")
                 continue
@@ -301,9 +311,9 @@ async def run_one_cycle(
                 persistence.update_finding(finding_id, "failed")
                 continue
 
-            # Gate (c) pytest + mypy + ruff
+            # Gate (c) pytest + mypy + ruff — run against integration worktree
             persistence.update_finding(finding_id, "testing")
-            gates_green, gate_output = run_gates(repo)
+            gates_green, gate_output = await asyncio.to_thread(run_gates, ig.worktree_path)
 
             # Route
             persistence.update_finding(finding_id, "routing")
@@ -322,15 +332,35 @@ async def run_one_cycle(
             )
             persistence.update_finding(finding_id, "done")
             findings_fixed += 1
+        except Exception:
+            log.exception("finding %s raised unexpected exception; marking failed", finding.bug_id)
+            try:
+                persistence.update_finding(finding_id, "failed")
+            except Exception:
+                pass  # persistence itself broken; finally still runs cleanup
+            findings_skipped += 1  # count as skipped so totals balance
         finally:
             # uniform cleanup — spec F4
             if t1 is not None:
-                await wm.acleanup_worktree(t1.id)
-                await wm.adelete_branch(t1.id)
+                try:
+                    await wm.acleanup_worktree(t1.id)
+                    await wm.adelete_branch(t1.id)
+                except Exception:
+                    log.exception("cleanup t1 failed for %s", finding.bug_id)
             if t2 is not None:
-                await wm.acleanup_worktree(t2.id)
-                await wm.adelete_branch(t2.id)
+                try:
+                    await wm.acleanup_worktree(t2.id)
+                    await wm.adelete_branch(t2.id)
+                except Exception:
+                    log.exception("cleanup t2 failed for %s", finding.bug_id)
+            if ig is not None:
+                try:
+                    await wm.acleanup_integration(ig)
+                except Exception:
+                    log.exception("cleanup integration failed for %s", finding.bug_id)
 
+    if broke_early:
+        cycle_status = "aborted"
     persistence.finish_cycle(cycle_id, cycle_status, total_cost)
     return CycleResult(
         cycle_id=cycle_id,
