@@ -354,23 +354,44 @@ async def run_one_cycle(
                 findings_skipped += 1  # count as skipped so totals balance
             finally:
                 # uniform cleanup — spec F4
+                # R3-A-02: shield each cleanup step from CancelledError so a
+                # SIGTERM that lands mid-finally cannot skip the remaining
+                # steps and leak worktrees/branches. CancelledError inherits
+                # from BaseException in 3.11+, so plain `except Exception`
+                # would let it propagate past the first cleanup. We collect
+                # all cleanup coroutine factories, run each under a per-step
+                # shield with its own try/except, then re-raise CancelledError
+                # at the end if any step saw one — so the outer cycle still
+                # marks itself 'aborted' via the existing handler.
+                from collections.abc import Awaitable
+                from typing import Callable
+
+                cleanups: list[tuple[Callable[[], Awaitable[None]], str]] = []
                 if t1 is not None:
-                    try:
-                        await wm.acleanup_worktree(t1.id)
-                        await wm.adelete_branch(t1.id)
-                    except Exception:
-                        log.exception("cleanup t1 failed for %s", finding.bug_id)
+                    t1_id = t1.id
+                    cleanups.append((lambda: wm.acleanup_worktree(t1_id), "cleanup t1 worktree"))
+                    cleanups.append((lambda: wm.adelete_branch(t1_id), "cleanup t1 branch"))
                 if t2 is not None:
-                    try:
-                        await wm.acleanup_worktree(t2.id)
-                        await wm.adelete_branch(t2.id)
-                    except Exception:
-                        log.exception("cleanup t2 failed for %s", finding.bug_id)
+                    t2_id = t2.id
+                    cleanups.append((lambda: wm.acleanup_worktree(t2_id), "cleanup t2 worktree"))
+                    cleanups.append((lambda: wm.adelete_branch(t2_id), "cleanup t2 branch"))
                 if ig is not None:
+                    ig_local = ig
+                    cleanups.append((lambda: wm.acleanup_integration(ig_local), "cleanup integration"))
+
+                cancelled = False
+                for factory, label in cleanups:
                     try:
-                        await wm.acleanup_integration(ig)
+                        await asyncio.shield(factory())
+                    except asyncio.CancelledError:
+                        cancelled = True
                     except Exception:
-                        log.exception("cleanup integration failed for %s", finding.bug_id)
+                        log.exception("%s failed for %s", label, finding.bug_id)
+                if cancelled:
+                    # All cleanups attempted; now honor the cancellation so
+                    # the outer try/except in run_one_cycle marks the cycle
+                    # 'aborted' and finish_cycle still runs.
+                    raise asyncio.CancelledError()
 
         if broke_early:
             cycle_status = "aborted"
