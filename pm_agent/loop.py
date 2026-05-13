@@ -331,6 +331,20 @@ async def run_one_cycle(
                 # Route
                 persistence.update_finding(finding_id, "routing")
                 pr_branch = ig.branch
+                # Push the integration branch so gh pr create can reference
+                # it. No-op when no origin is configured — downstream
+                # gh pr create then fails and the R4-1 guard below marks
+                # the finding failed. A real push failure (auth, network,
+                # protected ref) marks the finding failed immediately,
+                # without spending more on retries.
+                push_ok, push_err = await github.push_branch_to_origin(repo, pr_branch)
+                if not push_ok:
+                    log.warning(
+                        "git push failed for %s: %s — marking finding %s failed",
+                        pr_branch, push_err, finding.bug_id,
+                    )
+                    persistence.update_finding(finding_id, "failed")
+                    continue
                 if finding.severity in ("Critical", "High"):
                     pr = await github.open_pr(
                         pr_branch, finding,

@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 from pm_agent.scanner import Finding
@@ -107,6 +108,73 @@ def _build_pr_body(finding: Finding, body_extras: str = "") -> str:
     if body_extras:
         body += f"\n---\n\n**Pre-merge gate output (failed):**\n```\n{body_extras[:2000]}\n```\n"
     return body
+
+
+async def push_branch_to_origin(repo: Path, branch: str) -> tuple[bool, str]:
+    """``git push -u origin <branch>`` from *repo*.
+
+    Returns ``(ok, error_msg)``. ``ok`` is True when:
+      - the repo has no ``origin`` remote (no-op pass-through; downstream
+        ``gh pr create`` will fail and the R4-1 guard in loop.py will
+        mark the finding failed), or
+      - the push succeeded.
+
+    Without this step, ``gh pr create --head <branch>`` would fail for
+    any locally-created branch — gh refuses to PR a ref that doesn't
+    exist on the configured remote. Discovered post-dry-run-#2: the
+    Beta loop had never pushed at all, so the only way it ever opened
+    a PR was the latent R4-1 bug counting the *failed* call as a fix.
+
+    Timeout: 60s. Auth failure on push (stderr contains "Authentication
+    failed" / "denied") surfaces as ``(False, stderr)``; the loop should
+    treat that the same as a failed PR-create — mark finding failed and
+    continue (the next cycle's gh-auth-check will halt the daemon if
+    creds are genuinely broken).
+    """
+    # Probe: is origin configured?
+    proc = await asyncio.create_subprocess_exec(
+        "git", "-C", str(repo), "remote", "get-url", "origin",
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        await asyncio.wait_for(proc.communicate(), timeout=5.0)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        return False, "git remote get-url origin timed out"
+    if proc.returncode != 0:
+        # No origin → preserve existing no-remote behavior.
+        return True, ""
+
+    # Push the branch. -u sets upstream so re-pushes are cheap; the
+    # branch name is reused across cycles only if a prior PR exists
+    # (open_pr is idempotent), so -u is the right default.
+    proc = await asyncio.create_subprocess_exec(
+        "git", "-C", str(repo), "push", "-u", "origin", branch,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _out, err = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+    except asyncio.TimeoutError:
+        try:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        except (ProcessLookupError, asyncio.TimeoutError):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        return False, "git push timed out after 60s"
+    stderr = err.decode("utf-8", errors="replace") if err else ""
+    if proc.returncode != 0:
+        return False, stderr.strip()[:500]
+    return True, ""
 
 
 async def _find_existing_pr(branch: str) -> dict | None:

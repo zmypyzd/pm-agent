@@ -3,10 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+from pathlib import Path
 
 import pytest
 
-from pm_agent.github import open_pr, auto_merge, sync_pr_states, PRResult, PRState, GhAuthError
+from pm_agent.github import (
+    open_pr, auto_merge, sync_pr_states, push_branch_to_origin,
+    PRResult, PRState, GhAuthError,
+)
 from pm_agent.scanner import Finding
 from tests._fixtures.gh_shim import gh_shim
 
@@ -118,6 +123,92 @@ def test_auto_merge_already_enabled_is_queued_not_failed():
         f"expected auto-merge-queued, got {result.action!r}"
     )
     assert result.number == 8
+
+
+def _make_repo_with_origin(tmp_path: Path, with_origin: bool) -> tuple[Path, Path | None]:
+    """Build a local git repo. If with_origin=True, also build a bare
+    repo and wire it as 'origin' over file://. Returns (repo, bare or None)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = {
+        "GIT_AUTHOR_NAME": "t",  "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    (repo / "x.txt").write_text("hello\n")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "init"],
+        env={**env}, check=True,
+    )
+    if not with_origin:
+        return repo, None
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", f"file://{bare}"],
+        check=True,
+    )
+    return repo, bare
+
+
+def test_push_branch_to_origin_no_remote_returns_ok(tmp_path: Path) -> None:
+    """BUG: when no origin is configured, push_branch_to_origin must
+    return (True, "") so downstream `gh pr create` runs as before and
+    the existing no-remote behavior is preserved."""
+    repo, _ = _make_repo_with_origin(tmp_path, with_origin=False)
+    # Create a local branch with one extra commit so a hypothetical push
+    # would actually have something to send.
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "ai/T-1"], check=True)
+    (repo / "y.txt").write_text("ai\n")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "ai work"],
+        env={"GIT_AUTHOR_NAME":"t","GIT_AUTHOR_EMAIL":"t@t",
+             "GIT_COMMITTER_NAME":"t","GIT_COMMITTER_EMAIL":"t@t"},
+        check=True,
+    )
+    ok, err = asyncio.run(push_branch_to_origin(repo, "ai/T-1"))
+    assert ok, f"expected pass-through ok, got err={err!r}"
+    assert err == "", f"expected empty err, got {err!r}"
+
+
+def test_push_branch_to_origin_success(tmp_path: Path) -> None:
+    """With a real bare 'origin', the branch should land in the bare repo."""
+    repo, bare = _make_repo_with_origin(tmp_path, with_origin=True)
+    assert bare is not None
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "ai/T-1"], check=True)
+    (repo / "y.txt").write_text("ai\n")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "ai work"],
+        env={"GIT_AUTHOR_NAME":"t","GIT_AUTHOR_EMAIL":"t@t",
+             "GIT_COMMITTER_NAME":"t","GIT_COMMITTER_EMAIL":"t@t"},
+        check=True,
+    )
+    ok, err = asyncio.run(push_branch_to_origin(repo, "ai/T-1"))
+    assert ok, f"push failed: {err!r}"
+    # Verify the branch is actually in the bare repo
+    out = subprocess.run(
+        ["git", "-C", str(bare), "branch", "--list", "ai/T-1"],
+        capture_output=True, text=True, check=True,
+    )
+    assert "ai/T-1" in out.stdout, f"branch not in bare repo: {out.stdout!r}"
+
+
+def test_push_branch_to_origin_failure_returns_err(tmp_path: Path) -> None:
+    """Pointing 'origin' at a non-existent path should fail cleanly with
+    a non-empty error message — not raise, not hang."""
+    repo, _ = _make_repo_with_origin(tmp_path, with_origin=False)
+    # Wire a bogus origin: a path that doesn't exist anywhere on disk.
+    bogus = tmp_path / "does-not-exist-bare.git"
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", f"file://{bogus}"],
+        check=True,
+    )
+    ok, err = asyncio.run(push_branch_to_origin(repo, "main"))
+    assert not ok, "expected push to fail with bogus origin"
+    assert err, "expected non-empty error message"
 
 
 def test_gh_passes_yes_flag_to_pr_merge():
