@@ -37,6 +37,21 @@ uv run pm-agent dashboard serve --port 8000
 `--interval-s 1800` = 30 min between cycle ticks. Six-hour run ≈ 12 scans;
 twenty-four-hour run ≈ 48 scans.
 
+### Cost expectation (measured)
+
+| Scan target | Cost per cycle | Source |
+|---|---|---|
+| `--repo .` (pm-agent dogfood) | **$3.0 – $5.6 / cycle** | dry-run #1 (D1) + dry-run #2 (D2) |
+| Seed repo (`/tmp/pm-agent-day7-target`) | $0.5 – $1.0 / cycle | original runbook estimate (not yet re-measured post-R3/R4) |
+
+Dogfooding pm-agent itself is the priciest target because the scanner
+finds 5 mature findings per cycle and each one runs the full
+Coder-1 + Coder-2 + integration pipeline. Budget a real-LLM dogfood
+2h dry-run at **~$10 – $15**, a 6h run at ~$30 – $45, and a 24h run
+at ~$120 – $180. Use the seed repo for cheap smoke runs; switch to
+`--repo .` only when validating end-to-end behavior on a denser
+target.
+
 ## Hourly health check (during a 6h or 24h run)
 
 ```bash
@@ -49,7 +64,9 @@ Look for:
   a prior crash — investigate before continuing.
 - `errored + aborted` < 20% of `total`. Higher → environment instability,
   pause and read /tmp/loop.log.
-- Cumulative cost on track (~$0.50–$1.00/cycle for the seed repo).
+- Cumulative cost on track for the scan target — see the "Cost
+  expectation" table above (~$3-$5/cycle on `--repo .` dogfood,
+  ~$0.5-$1/cycle on the seed repo).
 
 If anything looks pathological:
 
