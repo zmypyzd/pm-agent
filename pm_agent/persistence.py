@@ -198,6 +198,38 @@ def fix_attempts(bug_id: str) -> int:
     return row["n"]
 
 
+def find_open_pr_for_bug(bug_id: str) -> int | None:
+    """Return the github_number of the newest still-open PR for *bug_id*,
+    or None if none exists.
+
+    BUG-R5-2: the scanner re-finds the same bug_id across cycles. Without
+    this gate, each re-discovery spawns a fresh Coder pipeline and opens
+    a duplicate PR (head branch differs because it embeds the cycle_id).
+    Callers (loop.run_one_cycle) check this first and skip the finding
+    when an OPEN PR already covers the bug — saves money and avoids
+    PR sprawl on the remote.
+
+    Joins findings → prs and filters on the synced PR state. The state
+    column is refreshed each cycle by github.sync_pr_states, so a PR
+    that was merged or closed out-of-band stops blocking after the
+    next cycle's sync.
+    """
+    row = get_conn().execute(
+        """
+        SELECT prs.github_number AS n
+        FROM prs
+        JOIN findings ON prs.finding_id = findings.id
+        WHERE findings.bug_id = ? AND prs.state = 'open'
+        ORDER BY prs.id DESC
+        LIMIT 1
+        """,
+        (bug_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row["n"])
+
+
 def update_finding(finding_id: int, status: FindingStatus) -> None:
     get_conn().execute(
         "UPDATE findings SET status=? WHERE id=?",

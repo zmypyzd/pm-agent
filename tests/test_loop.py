@@ -204,3 +204,38 @@ def test_run_one_cycle_skips_record_pr_on_failed_action():
     assert 0 < guard_pos < record_pos, (
         "regression: the action='failed' guard must run BEFORE record_pr"
     )
+
+
+def test_run_one_cycle_skips_finding_with_open_pr_for_bug():
+    """BUG-R5-2: when find_open_pr_for_bug returns a number for this
+    finding's bug_id, the loop must skip the Coder pipeline and mark
+    the finding 'skipped'. The gate must fire BEFORE Coder-1 spawns
+    (otherwise it wastes a real LLM call). Structural test in the
+    spirit of R3-A-02 / R4-1."""
+    import inspect, re
+    import pm_agent.loop as loop_mod
+
+    src = inspect.getsource(loop_mod.run_one_cycle)
+
+    # The gate pattern: a find_open_pr_for_bug check that marks the
+    # finding skipped and continues. Must use update_finding(..., "skipped")
+    # (not "failed" — the bug *will* land via the prior PR, this is just
+    # a duplicate route).
+    pattern = re.compile(
+        r'existing_pr\s*=\s*persistence\.find_open_pr_for_bug\(finding\.bug_id\)\s*\n'
+        r'\s+if\s+existing_pr\s+is\s+not\s+None\s*:\s*\n'
+        r'\s+persistence\.update_finding\([^,]+,\s*"skipped"\)',
+        re.MULTILINE,
+    )
+    assert pattern.search(src), (
+        "regression: run_one_cycle no longer guards against duplicate PRs "
+        "for the same bug_id. BUG-R5-2 will recur as soon as the scanner "
+        "re-finds an already-PR'd bug."
+    )
+
+    # Sanity: the gate must run BEFORE the first Coder spawn (wm.acreate).
+    gate_pos = src.find("find_open_pr_for_bug(finding.bug_id)")
+    coder_pos = src.find("wm.acreate(t1.id)")
+    assert 0 < gate_pos < coder_pos, (
+        "regression: the duplicate-PR gate must run BEFORE Coder-1 spawn"
+    )

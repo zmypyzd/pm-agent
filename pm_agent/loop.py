@@ -273,6 +273,22 @@ async def run_one_cycle(
             t2: CoderTask | None = None
             ig = None
             try:
+                # Gate (0) BUG-R5-2: duplicate-PR skip. Cheap query — if an
+                # OPEN PR already exists for this bug_id (re-found by a
+                # later cycle's scanner), don't spawn the Coder pipeline.
+                # Saves a full Coder-1+Coder-2+integration spend per
+                # duplicate and prevents PR sprawl on the remote. Runs
+                # BEFORE the 3-attempt / blocklist gates so it short-
+                # circuits as early as possible.
+                existing_pr = persistence.find_open_pr_for_bug(finding.bug_id)
+                if existing_pr is not None:
+                    persistence.update_finding(finding_id, "skipped")
+                    log.info(
+                        "skipping %s — open PR #%d already covers this bug",
+                        finding.bug_id, existing_pr,
+                    )
+                    findings_skipped += 1
+                    continue
                 # Gate (a) 3-cycle skip
                 if persistence.fix_attempts(finding.bug_id) >= 3:
                     persistence.update_finding(finding_id, "skipped")
