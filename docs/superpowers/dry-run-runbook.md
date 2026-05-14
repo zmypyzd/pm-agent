@@ -17,10 +17,22 @@ rm -rf ~/.pm-agent/state.db ~/.pm-agent/state.db-wal ~/.pm-agent/state.db-shm
 
 # 3. 30-second sanity check.
 uv run pm-agent loop preflight   # must end "✅ READY — all checks passed"
+
+# 4. Confirm the remote PRs will land on.
+git remote get-url origin        # must print https://github.com/zmypyzd/pm-agent.git
+                                 # (or whatever the canonical upstream is)
 ```
 
 If preflight fails: read its line items, fix the root cause, re-run. Do **not**
 launch with a FAIL — you'll burn LLM money on a misconfigured environment.
+
+The loop pushes integration branches with `git push -u origin <branch>` and
+then opens PRs via `gh pr create`. Both follow the local repo's `origin`,
+so changing the upstream is just `git remote set-url origin <new-url>`.
+The canonical upstream is `zmypyzd/pm-agent` (public). The historical
+`zmypyzd/pm-agent-dryrun` referenced in D2/D3 observation notes was a
+throwaway used before the canonical repo existed; do not point new dry-runs
+at it.
 
 ## Launch
 
