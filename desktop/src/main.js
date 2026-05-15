@@ -71,6 +71,13 @@ function applyState(s) {
     }
   }
 
+  const pet = $("pet");
+  if (s.cycle_status === "running") {
+    pet.classList.add("flapping");
+  } else {
+    pet.classList.remove("flapping");
+  }
+
   switch (s.cycle_status) {
     case "running":
       setBadge(`▶ ${s.findings_in_cycle}f / ${cost}`, "running");

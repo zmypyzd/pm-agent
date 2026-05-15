@@ -145,6 +145,10 @@ async fn show_menu(app: AppHandle, window: WebviewWindow) -> Result<(), String> 
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Persists window position + size across launches at
+        // ~/Library/Application Support/<bundle id>/window-state.json.
+        // Restores on next start with no extra code.
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .invoke_handler(tauri::generate_handler![show_menu])
         .setup(|app| {
             // State polling: emit only on change so the frontend doesn't
