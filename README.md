@@ -46,12 +46,26 @@ launched.
 
 ```bash
 # Build the .app (one-time, ~5 min fresh / ~12s incremental)
-cd desktop && npm install && npm run tauri build -- --bundles app
-mv src-tauri/target/release/bundle/macos/pm-agent-pet.app /Applications/
+cd desktop && npm install && npm run tauri build -- --bundles app dmg
+
+# Ad-hoc sign so macOS doesn't quarantine on first launch.
+APP=src-tauri/target/release/bundle/macos/pm-agent-pet.app
+codesign --force --deep --sign - "$APP"
+
+# Install
+cp -R "$APP" /Applications/
 
 # Optional: launch on every login
 ./scripts/autostart.sh install
 ```
+
+Built outputs:
+- `desktop/src-tauri/target/release/bundle/macos/pm-agent-pet.app` (10 MB)
+- `desktop/src-tauri/target/release/bundle/dmg/pm-agent-pet_0.1.0_aarch64.dmg` (3.8 MB, drag-to-Applications installer)
+
+Both are ad-hoc signed (`codesign -s -`). Distribution to other Macs
+still requires an Apple Developer ID; ad-hoc signing only suppresses
+the Gatekeeper warning for the building machine.
 
 What it does:
 - Frameless transparent always-on-top window, draggable, ~10 MB bundle.
