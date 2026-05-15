@@ -1,5 +1,6 @@
 const { invoke } = window.__TAURI__.core;
 const { getCurrentWindow } = window.__TAURI__.window;
+const { listen } = window.__TAURI__.event;
 
 const appWindow = getCurrentWindow();
 
@@ -28,7 +29,6 @@ function squish() {
   setTimeout(() => pet.classList.remove("squish"), 320);
 }
 
-// Idle blink — natural cadence with jitter.
 function scheduleBlink() {
   const wait = 2200 + Math.random() * 3200;
   setTimeout(() => {
@@ -41,41 +41,86 @@ function scheduleBlink() {
   }, wait);
 }
 
-// Hint for first-time users: small bubble that fades.
 function welcomeHint() {
   setTimeout(() => showBubble("右键看菜单 →", 3000), 800);
 }
 
-window.addEventListener("DOMContentLoaded", () => {
+// Translate a state snapshot into badge text/style + optional bubble.
+let lastState = null;
+function applyState(s) {
+  if (!s || !s.db_exists) {
+    setBadge("idle", "");
+    lastState = s;
+    return;
+  }
+
+  const cost = `$${s.cumulative_cost_usd.toFixed(2)}`;
+  const prev = lastState;
+
+  // Transition bubbles — only fire when the meaningful field changed.
+  if (prev && prev.db_exists) {
+    if (s.cycle_id !== prev.cycle_id && s.cycle_status === "running") {
+      showBubble(`Cycle ${s.cycle_id} started ▶`);
+    } else if (prev.cycle_status === "running" && s.cycle_status === "done") {
+      showBubble(`Cycle ${s.cycle_id} done ✓`);
+    } else if (prev.cycle_status === "running" && s.cycle_status === "errored") {
+      showBubble(`Cycle ${s.cycle_id} errored ✗`);
+    } else if (s.open_prs > prev.open_prs) {
+      const delta = s.open_prs - prev.open_prs;
+      showBubble(delta === 1 ? "+1 PR opened" : `+${delta} PRs opened`);
+    }
+  }
+
+  switch (s.cycle_status) {
+    case "running":
+      setBadge(`▶ ${s.findings_in_cycle}f / ${cost}`, "running");
+      break;
+    case "errored":
+    case "aborted":
+      setBadge(`✗ ${cost}`, "error");
+      break;
+    case "done":
+      setBadge(`✓ ${cost}`, "success");
+      break;
+    case "scan-empty":
+      setBadge(`empty · ${cost}`, "");
+      break;
+    default:
+      setBadge(`idle · ${cost}`, "");
+  }
+
+  lastState = s;
+}
+
+window.addEventListener("DOMContentLoaded", async () => {
   scheduleBlink();
   welcomeHint();
 
   const body = document.body;
 
-  // Left-button drag to move the frameless window.
   body.addEventListener("mousedown", async (e) => {
     if (e.button === 0) {
       try { await appWindow.startDragging(); } catch (err) { console.warn(err); }
     }
   });
 
-  // Click reaction: squish + brief acknowledgement.
   body.addEventListener("click", (e) => {
-    if (e.button === 0) {
-      squish();
-    }
+    if (e.button === 0) squish();
   });
 
-  // Right-click: ask Rust to pop up the menu at the current cursor.
   body.addEventListener("contextmenu", async (e) => {
     e.preventDefault();
     squish();
     try { await invoke("show_menu"); } catch (err) { console.error(err); }
   });
+
+  // Subscribe to state snapshots from the Rust polling task.
+  try {
+    await listen("pet-state", (event) => applyState(event.payload));
+  } catch (err) {
+    console.warn("pet-state subscribe failed:", err);
+  }
 });
 
-// Public hooks for Rust to invoke after menu actions land. Keeps the
-// pet "responsive" — the rust handler can call into JS via emit/event,
-// but for Phase 2 we expose simple globals as a stepping stone.
 window.petSay = showBubble;
 window.petBadge = setBadge;
