@@ -6,13 +6,67 @@ const appWindow = getCurrentWindow();
 
 const $ = (id) => document.getElementById(id);
 
-let bubbleTimer = null;
-function showBubble(text, ms = 2400) {
+// ---------- Notification queue ----------
+// The duck IS the notifier — so let multiple events line up instead of
+// clobbering each other. Errors jump the line.
+const queue = [];
+let queueRunning = false;
+let currentTimer = null;
+
+function notify(text, opts = {}) {
+  const item = {
+    text,
+    duration: opts.duration || 2400,
+    kind: opts.kind || "info",
+    pose: opts.pose || null,
+  };
+  if (opts.priority === "high") {
+    queue.unshift(item);
+    if (queueRunning && currentTimer) {
+      clearTimeout(currentTimer);
+      currentTimer = null;
+      queueRunning = false;
+    }
+  } else {
+    queue.push(item);
+  }
+  if (!queueRunning) runQueue();
+}
+
+function runQueue() {
+  if (queue.length === 0) {
+    queueRunning = false;
+    return;
+  }
+  queueRunning = true;
+  const n = queue.shift();
+  renderBubble(n.text, n.kind);
+  if (n.pose) triggerPose(n.pose);
+  currentTimer = setTimeout(() => {
+    hideBubble();
+    setTimeout(runQueue, 220);
+  }, n.duration);
+}
+
+function renderBubble(text, kind) {
   const b = $("bubble");
   b.textContent = text;
-  b.classList.remove("hidden");
-  if (bubbleTimer) clearTimeout(bubbleTimer);
-  bubbleTimer = setTimeout(() => b.classList.add("hidden"), ms);
+  b.className = "bubble " + (kind || "");
+}
+
+function hideBubble() {
+  const b = $("bubble");
+  b.classList.add("hidden");
+}
+
+// ---------- Pose animations ----------
+function triggerPose(name) {
+  const pet = $("pet");
+  ["happy", "sad", "squish"].forEach((c) => pet.classList.remove(c));
+  void pet.offsetWidth;
+  pet.classList.add(name);
+  const dur = name === "happy" ? 900 : name === "sad" ? 1200 : 320;
+  setTimeout(() => pet.classList.remove(name), dur);
 }
 
 function setBadge(text, state) {
@@ -22,56 +76,73 @@ function setBadge(text, state) {
 }
 
 function squish() {
-  const pet = $("pet");
-  pet.classList.remove("squish");
-  void pet.offsetWidth; // restart animation
-  pet.classList.add("squish");
-  setTimeout(() => pet.classList.remove("squish"), 320);
+  triggerPose("squish");
 }
 
+// ---------- Idle behaviours ----------
 function scheduleBlink() {
   const wait = 2200 + Math.random() * 3200;
   setTimeout(() => {
-    const lid = $("eyelid");
-    lid.classList.add("blink");
-    setTimeout(() => {
-      lid.classList.remove("blink");
-      scheduleBlink();
-    }, 110);
+    if (!$("pet").classList.contains("sleeping")) {
+      const lid = $("eyelid");
+      lid.classList.add("blink");
+      setTimeout(() => lid.classList.remove("blink"), 110);
+    }
+    scheduleBlink();
   }, wait);
 }
 
 function welcomeHint() {
-  setTimeout(() => showBubble("右键看菜单 →", 3000), 800);
+  setTimeout(() => notify("右键看菜单 →", { duration: 3000 }), 800);
 }
 
-// Translate a state snapshot into badge text/style + optional bubble.
+// ---------- State → presentation ----------
 let lastState = null;
+let sleepTimer = null;
+
 function applyState(s) {
+  const pet = $("pet");
+
   if (!s || !s.db_exists) {
     setBadge("idle", "");
+    // Drift to "sleeping" after 30s with no state at all.
+    if (!sleepTimer) {
+      sleepTimer = setTimeout(() => pet.classList.add("sleeping"), 30000);
+    }
     lastState = s;
     return;
   }
 
+  // Any real state wakes the duck.
+  pet.classList.remove("sleeping");
+  if (sleepTimer) { clearTimeout(sleepTimer); sleepTimer = null; }
+
   const cost = `$${s.cumulative_cost_usd.toFixed(2)}`;
   const prev = lastState;
 
-  // Transition bubbles — only fire when the meaningful field changed.
   if (prev && prev.db_exists) {
     if (s.cycle_id !== prev.cycle_id && s.cycle_status === "running") {
-      showBubble(`Cycle ${s.cycle_id} started ▶`);
+      notify(`Cycle ${s.cycle_id} started ▶`, { kind: "info" });
     } else if (prev.cycle_status === "running" && s.cycle_status === "done") {
-      showBubble(`Cycle ${s.cycle_id} done ✓`);
-    } else if (prev.cycle_status === "running" && s.cycle_status === "errored") {
-      showBubble(`Cycle ${s.cycle_id} errored ✗`);
+      notify(`Cycle ${s.cycle_id} done ✓ ${cost}`, { kind: "success", pose: "happy" });
+    } else if (
+      prev.cycle_status === "running" &&
+      (s.cycle_status === "errored" || s.cycle_status === "aborted")
+    ) {
+      notify(`Cycle ${s.cycle_id} ${s.cycle_status} ✗`, {
+        kind: "error",
+        pose: "sad",
+        priority: "high",
+        duration: 3200,
+      });
     } else if (s.open_prs > prev.open_prs) {
-      const delta = s.open_prs - prev.open_prs;
-      showBubble(delta === 1 ? "+1 PR opened" : `+${delta} PRs opened`);
+      const d = s.open_prs - prev.open_prs;
+      notify(d === 1 ? "+1 PR opened" : `+${d} PRs opened`, { kind: "success" });
+    } else if (s.findings_in_cycle > prev.findings_in_cycle && s.findings_in_cycle >= 5) {
+      notify(`${s.findings_in_cycle} findings this cycle`, { kind: "warn" });
     }
   }
 
-  const pet = $("pet");
   if (s.cycle_status === "running") {
     pet.classList.add("flapping");
   } else {
@@ -121,7 +192,6 @@ window.addEventListener("DOMContentLoaded", async () => {
     try { await invoke("show_menu"); } catch (err) { console.error(err); }
   });
 
-  // Subscribe to state snapshots from the Rust polling task.
   try {
     await listen("pet-state", (event) => applyState(event.payload));
   } catch (err) {
@@ -129,5 +199,5 @@ window.addEventListener("DOMContentLoaded", async () => {
   }
 });
 
-window.petSay = showBubble;
+window.petSay = (text, opts) => notify(text, opts || {});
 window.petBadge = setBadge;
