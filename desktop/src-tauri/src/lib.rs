@@ -124,6 +124,16 @@ fn read_state() -> StateSnapshot {
     }
 }
 
+// JS calls this to grow/shrink the window when the mini panel is
+// shown/hidden. We keep this in Rust so the JS doesn't have to import
+// LogicalSize through the global tauri namespace (which varies by build).
+#[tauri::command]
+async fn set_window_size(window: WebviewWindow, width: f64, height: f64) -> Result<(), String> {
+    window
+        .set_size(tauri::LogicalSize::new(width, height))
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn show_menu(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
     let demo = MenuItem::with_id(&app, "demo", "▶  Run demo", true, None::<&str>)
@@ -149,7 +159,7 @@ pub fn run() {
         // ~/Library/Application Support/<bundle id>/window-state.json.
         // Restores on next start with no extra code.
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .invoke_handler(tauri::generate_handler![show_menu])
+        .invoke_handler(tauri::generate_handler![show_menu, set_window_size])
         .setup(|app| {
             // State polling: emit only on change so the frontend doesn't
             // re-render at 0.5 Hz for nothing. 2s cadence is well below

@@ -126,6 +126,97 @@ body:active {
 .bubble.error   { background: #fde3e3; color: #7a0c0c; }
 .bubble.error::after   { background: #fde3e3; }
 
+/* Mini panel — shown on left-click. Sits below the duck, lives in the
+   window's expanded 220x320 slot. */
+.panel {
+  position: absolute;
+  top: 168px;
+  left: 8px;
+  right: 8px;
+  height: 144px;
+  background: rgba(255, 255, 255, 0.97);
+  border-radius: 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22),
+              0 0 0 0.5px rgba(0, 0, 0, 0.06);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 0.22s, transform 0.22s;
+  pointer-events: auto;
+  cursor: default;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.panel.hidden {
+  opacity: 0;
+  transform: translateY(-8px);
+  pointer-events: none;
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro", sans-serif;
+}
+
+.panel-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #6b7280;
+}
+
+.panel-cost {
+  font-size: 12px;
+  font-weight: 600;
+  color: #111827;
+  font-variant-numeric: tabular-nums;
+}
+
+.panel-history {
+  list-style: none;
+  padding: 0;
+  margin: 6px 0 0;
+  flex: 1;
+  overflow-y: auto;
+  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.panel-history li {
+  padding: 2px 0;
+  color: #1f2937;
+  display: flex;
+  gap: 6px;
+}
+
+.panel-history li .t {
+  color: #9ca3af;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.panel-history li.success { color: #166534; }
+.panel-history li.warn    { color: #92400e; }
+.panel-history li.error   { color: #991b1b; }
+.panel-history li.empty   { color: #9ca3af; font-style: italic; }
+
+.panel-footer {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 0.5px solid rgba(0, 0, 0, 0.08);
+  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 10.5px;
+  color: #4b5563;
+  font-variant-numeric: tabular-nums;
+}
+
 #duck {
   width: 120px;
   height: 120px;

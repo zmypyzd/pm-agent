@@ -6,9 +6,17 @@ const appWindow = getCurrentWindow();
 
 const $ = (id) => document.getElementById(id);
 
+const COLLAPSED = { w: 140, h: 160 };
+const EXPANDED = { w: 220, h: 320 };
+
+// ---------- Event history (drives the mini panel) ----------
+const history = [];
+function pushHistory(text, kind) {
+  history.push({ at: new Date(), text, kind: kind || "info" });
+  if (history.length > 30) history.shift();
+}
+
 // ---------- Notification queue ----------
-// The duck IS the notifier — so let multiple events line up instead of
-// clobbering each other. Errors jump the line.
 const queue = [];
 let queueRunning = false;
 let currentTimer = null;
@@ -19,7 +27,9 @@ function notify(text, opts = {}) {
     duration: opts.duration || 2400,
     kind: opts.kind || "info",
     pose: opts.pose || null,
+    silent: !!opts.silent,
   };
+  if (!item.silent) pushHistory(text, item.kind);
   if (opts.priority === "high") {
     queue.unshift(item);
     if (queueRunning && currentTimer) {
@@ -52,7 +62,6 @@ function renderBubble(text, kind) {
   const b = $("bubble");
   b.textContent = text;
   b.className = "bubble " + (kind || "");
-  // Quack: brief mouth-open animation aligned with bubble appearance.
   const pet = $("pet");
   pet.classList.remove("quacking");
   void pet.offsetWidth;
@@ -61,11 +70,9 @@ function renderBubble(text, kind) {
 }
 
 function hideBubble() {
-  const b = $("bubble");
-  b.classList.add("hidden");
+  $("bubble").classList.add("hidden");
 }
 
-// ---------- Pose animations ----------
 function triggerPose(name) {
   const pet = $("pet");
   ["happy", "sad", "squish"].forEach((c) => pet.classList.remove(c));
@@ -81,8 +88,61 @@ function setBadge(text, state) {
   badge.className = "badge" + (state ? " " + state : "");
 }
 
-function squish() {
-  triggerPose("squish");
+function squish() { triggerPose("squish"); }
+
+// ---------- Mini panel ----------
+let panelOpen = false;
+let panelBusy = false;
+
+async function togglePanel() {
+  if (panelBusy) return;
+  panelBusy = true;
+  const panel = $("panel");
+  if (!panelOpen) {
+    try { await invoke("set_window_size", { width: EXPANDED.w, height: EXPANDED.h }); } catch (e) { console.error(e); }
+    renderPanel();
+    panel.classList.remove("hidden");
+    panelOpen = true;
+  } else {
+    panel.classList.add("hidden");
+    // Wait for fade-out before shrinking the window.
+    setTimeout(async () => {
+      try { await invoke("set_window_size", { width: COLLAPSED.w, height: COLLAPSED.h }); } catch (e) { console.error(e); }
+    }, 240);
+    panelOpen = false;
+  }
+  panelBusy = false;
+}
+
+function renderPanel() {
+  const list = $("panel-history");
+  list.innerHTML = "";
+  if (history.length === 0) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = "no events yet";
+    list.appendChild(li);
+  } else {
+    history.slice().reverse().forEach((h) => {
+      const li = document.createElement("li");
+      li.className = h.kind || "";
+      const t = h.at.toTimeString().slice(0, 5);
+      li.innerHTML = `<span class="t">${t}</span><span>${escapeHtml(h.text)}</span>`;
+      list.appendChild(li);
+    });
+  }
+  $("panel-cost").textContent = (lastState && lastState.db_exists)
+    ? `$${lastState.cumulative_cost_usd.toFixed(2)}`
+    : "$0.00";
+  $("panel-cycle").textContent = (lastState && lastState.cycle_id)
+    ? `cycle ${lastState.cycle_id} · ${lastState.cycle_status}${lastState.findings_in_cycle ? " · " + lastState.findings_in_cycle + "f" : ""}`
+    : "no cycle yet";
+}
+
+function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
 }
 
 // ---------- Idle behaviours ----------
@@ -99,7 +159,7 @@ function scheduleBlink() {
 }
 
 function welcomeHint() {
-  setTimeout(() => notify("右键看菜单 →", { duration: 3000 }), 800);
+  setTimeout(() => notify("点鸭子看记录 · 右键看菜单", { duration: 3200, silent: true }), 800);
 }
 
 // ---------- State → presentation ----------
@@ -111,15 +171,14 @@ function applyState(s) {
 
   if (!s || !s.db_exists) {
     setBadge("idle", "");
-    // Drift to "sleeping" after 30s with no state at all.
     if (!sleepTimer) {
       sleepTimer = setTimeout(() => pet.classList.add("sleeping"), 30000);
     }
     lastState = s;
+    if (panelOpen) renderPanel();
     return;
   }
 
-  // Any real state wakes the duck.
   pet.classList.remove("sleeping");
   if (sleepTimer) { clearTimeout(sleepTimer); sleepTimer = null; }
 
@@ -149,31 +208,25 @@ function applyState(s) {
     }
   }
 
-  if (s.cycle_status === "running") {
-    pet.classList.add("flapping");
-  } else {
-    pet.classList.remove("flapping");
-  }
+  if (s.cycle_status === "running") pet.classList.add("flapping");
+  else pet.classList.remove("flapping");
 
   switch (s.cycle_status) {
     case "running":
-      setBadge(`▶ ${s.findings_in_cycle}f / ${cost}`, "running");
-      break;
+      setBadge(`▶ ${s.findings_in_cycle}f / ${cost}`, "running"); break;
     case "errored":
     case "aborted":
-      setBadge(`✗ ${cost}`, "error");
-      break;
+      setBadge(`✗ ${cost}`, "error"); break;
     case "done":
-      setBadge(`✓ ${cost}`, "success");
-      break;
+      setBadge(`✓ ${cost}`, "success"); break;
     case "scan-empty":
-      setBadge(`empty · ${cost}`, "");
-      break;
+      setBadge(`empty · ${cost}`, ""); break;
     default:
       setBadge(`idle · ${cost}`, "");
   }
 
   lastState = s;
+  if (panelOpen) renderPanel();
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
@@ -183,13 +236,16 @@ window.addEventListener("DOMContentLoaded", async () => {
   const body = document.body;
 
   body.addEventListener("mousedown", async (e) => {
-    if (e.button === 0) {
+    if (e.button === 0 && !e.target.closest(".panel")) {
       try { await appWindow.startDragging(); } catch (err) { console.warn(err); }
     }
   });
 
   body.addEventListener("click", (e) => {
-    if (e.button === 0) squish();
+    if (e.button !== 0) return;
+    if (e.target.closest(".panel")) return;
+    squish();
+    togglePanel();
   });
 
   body.addEventListener("contextmenu", async (e) => {
