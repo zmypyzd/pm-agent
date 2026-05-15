@@ -38,6 +38,32 @@ Zero flags. Creates `/tmp/pm-agent-day7-target` from scratch and runs the canoni
 
 **New here? → [`docs/QUICKSTART.md`](docs/QUICKSTART.md)** — the 5-minute hands-on guide.
 
+## Desktop pet (no CLI)
+
+A small always-on-top duck that displays live cycle state and runs the
+same actions from a right-click menu — no terminal needed once it's
+launched.
+
+```bash
+# Build the .app (one-time, ~5 min fresh / ~12s incremental)
+cd desktop && npm install && npm run tauri build -- --bundles app
+mv src-tauri/target/release/bundle/macos/pm-agent-pet.app /Applications/
+
+# Optional: launch on every login
+./scripts/autostart.sh install
+```
+
+What it does:
+- Frameless transparent always-on-top window, draggable, ~10 MB bundle.
+- Right-click → Run demo / Start loop / Open dashboard / Quit.
+- Reads `~/.pm-agent/state.db` every 2s; badge reflects live state
+  (`▶ Nf / $X.XX` while a cycle is running, `✓ $X.XX` when done, etc.).
+- Speaks via speech bubbles on transitions: cycle started, PR opened,
+  cycle done (happy bounce), cycle errored (sad droop, priority alert).
+- Drifts to a "sleeping" pose with floating Zz when there's no
+  state.db.
+- Window position persists across launches.
+
 ## Other entry points
 
 ```bash
