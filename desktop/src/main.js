@@ -243,39 +243,12 @@ function applyState(s) {
   if (panelOpen) renderPanel();
 }
 
-// ---------- Eye tracking ----------
-// Both pupils glance toward the cursor independently, using each eye's
-// own centre so they don't both move in lockstep.
-function bindEyeTracking() {
-  const pl = $("pupil-left");
-  const pr = $("pupil-right");
-  if (!pl || !pr) return;
-  // SVG viewBox centres: left eye (38, 32), right eye (62, 32) → fractions
-  const EYES = [
-    { el: pl, fx: 0.38, fy: 0.32 },
-    { el: pr, fx: 0.62, fy: 0.32 },
-  ];
-  document.addEventListener("mousemove", (e) => {
-    const sleeping = $("pet").classList.contains("sleeping");
-    if (sleeping) { pl.style.transform = ""; pr.style.transform = ""; return; }
-    const duck = $("duck").getBoundingClientRect();
-    EYES.forEach(({ el, fx, fy }) => {
-      const cx = duck.left + duck.width * fx;
-      const cy = duck.top + duck.height * fy;
-      const dx = e.clientX - cx;
-      const dy = e.clientY - cy;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      const max = 2.4;
-      const px = (dx / Math.max(dist, 1)) * Math.min(max, dist / 40);
-      const py = (dy / Math.max(dist, 1)) * Math.min(max, dist / 40);
-      el.style.transform = `translate(${px}px, ${py}px)`;
-    });
-  });
-}
+// Eye tracking is disabled with the PNG body — the painted eyes are
+// fixed; trying to overlay movable pupils on top causes a double-eye
+// artifact. Path B chose the PNG's polish over the live-glance effect.
 
 window.addEventListener("DOMContentLoaded", async () => {
   scheduleBlink();
-  bindEyeTracking();
   welcomeHint();
 
   // Delegate panel-history clicks → open URL.

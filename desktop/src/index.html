@@ -11,134 +11,27 @@
     <div id="pet" class="pet" title="pm-agent — drag to move, right-click for menu">
       <div id="bubble" class="bubble hidden"></div>
       <div class="zz">Zz</div>
-      <svg id="duck" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-        <!-- Feet (back layer; body overlaps their tops slightly) -->
-        <path d="M 32 88
-                 C 30 91, 31 95, 36 95
-                 C 41 95, 43 93, 42 89
-                 C 41 88, 36 87, 32 88 Z"
-              fill="#FF8C00" stroke="#1a1a1a" stroke-width="1.8" stroke-linejoin="round"/>
-        <path d="M 58 89
-                 C 57 93, 59 95, 64 95
-                 C 70 95, 71 91, 69 88
-                 C 65 87, 60 88, 58 89 Z"
-              fill="#FF8C00" stroke="#1a1a1a" stroke-width="1.8" stroke-linejoin="round"/>
-
-        <!-- Main silhouette: tuft → top of head → right cheek → right
-             body → bottom → left body → left cheek → tuft. Many cubic
-             segments so the curve has personality, not a smooth oval. -->
-        <path d="M 38 9
-                 C 34 5, 32 1, 36 1
-                 C 39 1, 41 4, 42 7
-                 C 47 5, 53 5, 58 6
-                 C 65 7, 73 11, 79 17
-                 C 84 22, 87 30, 86 38
-                 C 86 42, 85 45, 84 47
-                 C 88 50, 91 57, 91 66
-                 C 91 76, 86 85, 78 90
-                 C 72 93, 64 94, 56 94
-                 C 49 94, 43 94, 36 92
-                 C 25 90, 15 83, 11 73
-                 C 8 64, 9 55, 13 49
-                 C 14 48, 15 47, 16 46
-                 C 14 43, 13 40, 13 36
-                 C 13 28, 17 21, 23 16
-                 C 27 12, 31 10, 35 9
-                 C 36 9, 37 9, 38 9 Z"
-              fill="#FFD93D" stroke="#1a1a1a" stroke-width="2.4" stroke-linejoin="round"/>
-
-        <!-- Inner detail: belly contour on viewer's left + wing-fold
-             curve on viewer's right. Half-opacity so they read as
-             contour shading rather than full outlines. -->
-        <path d="M 20 50
-                 C 19 60, 22 72, 30 82"
-              fill="none" stroke="#1a1a1a" stroke-width="1.3"
-              stroke-linecap="round" opacity="0.55"/>
-        <path d="M 72 56
-                 C 78 64, 78 76, 72 84"
-              fill="none" stroke="#1a1a1a" stroke-width="1.3"
-              stroke-linecap="round" opacity="0.55"/>
-
-        <!-- Animated wing on viewer's left, peeking out from body. -->
-        <g id="wing">
-          <path d="M 18 55
-                   C 12 58, 9 66, 11 74
-                   C 13 78, 17 80, 22 78
-                   C 25 76, 26 70, 25 62
-                   C 24 58, 21 55, 18 55 Z"
-                fill="#FFD93D" stroke="#1a1a1a" stroke-width="1.8" stroke-linejoin="round"/>
-        </g>
-
-        <!-- Eyebrow arcs above each eye (signature happy-curve) -->
-        <path d="M 28 20
-                 C 32 16, 39 16, 44 20"
-              fill="none" stroke="#1a1a1a" stroke-width="1.7"
-              stroke-linecap="round"/>
-        <path d="M 56 20
-                 C 61 16, 68 16, 72 20"
-              fill="none" stroke="#1a1a1a" stroke-width="1.7"
-              stroke-linecap="round"/>
-
-        <!-- Eyes: predominantly BLACK ovals with a small white
-             highlight sitting upper-left, the way the reference draws
-             them. The wrapping <g> is what eye-tracking translates;
-             the highlight rides with it so the eye stays alive. -->
-        <g id="eye-left">
-          <g id="pupil-left">
-            <ellipse cx="36" cy="31" rx="5.2" ry="6.8" fill="#1a1a1a"/>
-            <circle cx="34" cy="28" r="1.9" fill="#ffffff"/>
-            <circle cx="38" cy="33" r="0.8" fill="#ffffff" opacity="0.7"/>
-          </g>
-          <path id="closed-eye-left"
-                d="M 30 31 Q 36 34 42 31"
-                fill="none" stroke="#1a1a1a" stroke-width="2.2"
-                stroke-linecap="round"/>
-        </g>
-        <g id="eye-right">
-          <g id="pupil-right">
-            <ellipse cx="62" cy="31" rx="5.2" ry="6.8" fill="#1a1a1a"/>
-            <circle cx="60" cy="28" r="1.9" fill="#ffffff"/>
-            <circle cx="64" cy="33" r="0.8" fill="#ffffff" opacity="0.7"/>
-          </g>
-          <path id="closed-eye-right"
-                d="M 56 31 Q 62 34 68 31"
-                fill="none" stroke="#1a1a1a" stroke-width="2.2"
-                stroke-linecap="round"/>
-        </g>
-
-        <!-- Beak: horizontal diamond shape, single peach colour at
-             rest. Split as top/bot paths so the quack animation can
-             pull them apart. -->
-        <g id="beak">
-          <path id="beak-top"
-                d="M 36 41
-                   C 42 38, 58 38, 64 41
-                   C 64 43, 60 45, 50 45
-                   C 40 45, 36 43, 36 41 Z"
-                fill="#FF9A2A" stroke="#1a1a1a" stroke-width="1.7"
-                stroke-linejoin="round"/>
-          <path id="beak-bot"
-                d="M 36 45
-                   C 40 48, 60 48, 64 45
-                   C 60 49, 56 51, 50 51
-                   C 44 51, 40 49, 36 45 Z"
-                fill="#E87A00" stroke="#1a1a1a" stroke-width="1.7"
-                stroke-linejoin="round"/>
-        </g>
-
-        <!-- Bow tie at neck/chest: two soft triangular wings with
-             curved outer edges, plus a small oval centre knot. -->
-        <g id="bowtie">
-          <path d="M 50 62
-                   C 44 57, 38 58, 39 64
-                   C 38 69, 43 70, 50 66 Z"
-                fill="#1a1a1a"/>
-          <path d="M 50 62
-                   C 56 57, 62 58, 61 64
-                   C 62 69, 57 70, 50 66 Z"
-                fill="#1a1a1a"/>
-          <ellipse cx="50" cy="64" rx="2.2" ry="2.8" fill="#1a1a1a"/>
-        </g>
+      <img id="duck" src="assets/duck.png" alt="" draggable="false"/>
+      <!-- Overlay layer for animations that the painted PNG can't do
+           on its own (blink + sleep). Positions are tuned to land
+           exactly on the painted eyes in duck.png. -->
+      <svg class="duck-overlay" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+        <!-- Eyelid covers sized to fully hide the painted eyes when
+             opacity = 1. Positions tuned against duck.png:
+             left eye centre ~ (33, 33), right ~ (58, 33). The yellow
+             fill matches the body's #FFD93D so the cover reads as
+             closed eyelid skin. -->
+        <ellipse id="eyelid-cover-left"  cx="33" cy="33" rx="5.2" ry="6"
+                 fill="#FFD93D" stroke="#1a1a1a" stroke-width="1.5" opacity="0"/>
+        <ellipse id="eyelid-cover-right" cx="58" cy="33" rx="5.2" ry="6"
+                 fill="#FFD93D" stroke="#1a1a1a" stroke-width="1.5" opacity="0"/>
+        <!-- Closed-eye smile lines drawn over the covers -->
+        <path id="closed-eye-left"
+              d="M 28 33 Q 33 36 38 33" opacity="0"
+              fill="none" stroke="#1a1a1a" stroke-width="2.2" stroke-linecap="round"/>
+        <path id="closed-eye-right"
+              d="M 53 33 Q 58 36 63 33" opacity="0"
+              fill="none" stroke="#1a1a1a" stroke-width="2.2" stroke-linecap="round"/>
       </svg>
       <div id="badge" class="badge">idle</div>
       <div id="panel" class="panel hidden">
