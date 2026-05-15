@@ -75,10 +75,6 @@ body:active {
   60%      { transform: translateY(3px) rotate(-3deg); }
 }
 
-.pet.sleeping #eyelid-left,
-.pet.sleeping #eyelid-right {
-  height: 11px;
-}
 
 .zz {
   position: absolute;
@@ -237,17 +233,27 @@ body:active {
   transition: transform 0.18s ease-out;
 }
 
-#eyelid-left, #eyelid-right {
-  transition: height 0.08s ease-in-out;
-  transform-origin: center;
-}
-
-#eyelid-left.blink, #eyelid-right.blink {
-  height: 9px;
-}
-
 #pupil-left, #pupil-right {
-  transition: transform 0.2s ease-out;
+  transition: transform 0.2s ease-out, opacity 0.06s ease-in-out;
+}
+
+#closed-eye-left, #closed-eye-right {
+  opacity: 0;
+  transition: opacity 0.06s ease-in-out;
+}
+
+.pet.blinking #pupil-left,
+.pet.blinking #pupil-right,
+.pet.sleeping #pupil-left,
+.pet.sleeping #pupil-right {
+  opacity: 0;
+}
+
+.pet.blinking #closed-eye-left,
+.pet.blinking #closed-eye-right,
+.pet.sleeping #closed-eye-left,
+.pet.sleeping #closed-eye-right {
+  opacity: 1;
 }
 
 #wing {

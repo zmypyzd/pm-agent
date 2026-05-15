@@ -160,15 +160,10 @@ function escapeHtml(s) {
 function scheduleBlink() {
   const wait = 2200 + Math.random() * 3200;
   setTimeout(() => {
-    if (!$("pet").classList.contains("sleeping")) {
-      const left = $("eyelid-left");
-      const right = $("eyelid-right");
-      left.classList.add("blink");
-      right.classList.add("blink");
-      setTimeout(() => {
-        left.classList.remove("blink");
-        right.classList.remove("blink");
-      }, 120);
+    const pet = $("pet");
+    if (!pet.classList.contains("sleeping")) {
+      pet.classList.add("blinking");
+      setTimeout(() => pet.classList.remove("blinking"), 140);
     }
     scheduleBlink();
   }, wait);
