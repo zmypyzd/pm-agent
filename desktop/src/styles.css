@@ -251,20 +251,20 @@ body:active {
 }
 
 #wing {
-  /* Pivot at the inner-top of the wing (where it attaches to body) so
-     the wing rotates outward like an arm raising. */
+  /* Wing is on viewer's left; pivot at its top-right (body attachment)
+     so positive rotation swings the tip outward to the left/down. */
   transform-origin: 100% 0%;
   transform-box: fill-box;
   transition: transform 0.2s;
 }
 
 .pet.flapping #wing {
-  animation: flap 0.5s ease-in-out infinite;
+  animation: flap 0.55s ease-in-out infinite;
 }
 
 @keyframes flap {
   0%, 100% { transform: rotate(0deg); }
-  50%      { transform: rotate(-28deg); }
+  50%      { transform: rotate(26deg); }
 }
 
 .badge {

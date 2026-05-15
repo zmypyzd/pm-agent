@@ -12,48 +12,84 @@
       <div id="bubble" class="bubble hidden"></div>
       <div class="zz">Zz</div>
       <svg id="duck" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-        <!-- Feet (back-bottom layer) -->
-        <ellipse cx="40" cy="92" rx="7" ry="4" fill="#FF8C00" stroke="#1a1a1a" stroke-width="1.6"/>
-        <ellipse cx="60" cy="92" rx="7" ry="4" fill="#FF8C00" stroke="#1a1a1a" stroke-width="1.6"/>
-        <!-- Lower body -->
-        <ellipse cx="50" cy="68" rx="32" ry="22" fill="#FFD93D" stroke="#1a1a1a" stroke-width="2"/>
-        <!-- Head -->
-        <circle cx="50" cy="32" r="26" fill="#FFD93D" stroke="#1a1a1a" stroke-width="2"/>
-        <!-- Tuft (head wisp) -->
-        <path d="M 47 5 Q 50 0 53 5 Q 52 9 50 9 Q 48 9 47 5 Z"
-              fill="#FFD93D" stroke="#1a1a1a" stroke-width="1.6"/>
-        <!-- Left arm/wing (static, mirror of right) -->
-        <path id="wing-left"
-              d="M 16 60 Q 11 68 17 80 Q 26 80 27 70 Q 24 62 16 60 Z"
-              fill="#FFD93D" stroke="#1a1a1a" stroke-width="1.8"/>
-        <!-- Right arm/wing (animated for flap state) -->
-        <g id="wing" class="wing">
-          <path d="M 84 60 Q 89 68 83 80 Q 74 80 73 70 Q 76 62 84 60 Z"
-                fill="#FFD93D" stroke="#1a1a1a" stroke-width="1.8"/>
+        <!-- Feet (drawn first so the body overlaps their tops) -->
+        <path d="M 32 92 Q 30 97 38 97 Q 44 97 44 92 Z"
+              fill="#FF8C00" stroke="#1a1a1a" stroke-width="1.8" stroke-linejoin="round"/>
+        <path d="M 56 92 Q 56 97 62 97 Q 70 97 68 92 Z"
+              fill="#FF8C00" stroke="#1a1a1a" stroke-width="1.8" stroke-linejoin="round"/>
+
+        <!-- Body silhouette: ONE merged path so there's no neck seam. -->
+        <path d="M 50 4
+                 C 30 4, 16 16, 14 30
+                 C 13 38, 13 42, 16 46
+                 C 12 52, 9 60, 11 70
+                 C 13 82, 22 92, 32 93
+                 C 38 94, 62 94, 68 93
+                 C 78 92, 87 82, 89 70
+                 C 91 60, 88 52, 84 46
+                 C 87 42, 87 38, 86 30
+                 C 84 16, 70 4, 50 4 Z"
+              fill="#FFD93D" stroke="#1a1a1a" stroke-width="2.2" stroke-linejoin="round"/>
+
+        <!-- Belly contour: subtle inner curve on viewer's left -->
+        <path d="M 22 50 Q 22 64 30 76 Q 36 80 42 80"
+              fill="none" stroke="#1a1a1a" stroke-width="1" opacity="0.45" stroke-linecap="round"/>
+
+        <!-- Tuft (single soft wisp) -->
+        <path d="M 48 5 Q 50 0 53 4 Q 53 8 51 8 Q 49 8 48 5 Z"
+              fill="#FFD93D" stroke="#1a1a1a" stroke-width="1.6" stroke-linejoin="round"/>
+
+        <!-- Folded wing indication on viewer's right (decorative line only) -->
+        <path d="M 76 58 Q 80 68 76 80"
+              fill="none" stroke="#1a1a1a" stroke-width="1.6" stroke-linecap="round"/>
+
+        <!-- Animated wing on viewer's left (the one that flaps) -->
+        <g id="wing">
+          <path d="M 22 58 Q 14 64 16 78 Q 22 82 28 78 Q 26 68 22 58 Z"
+                fill="#FFD93D" stroke="#1a1a1a" stroke-width="1.8" stroke-linejoin="round"/>
         </g>
-        <!-- Eyes -->
+
+        <!-- Eyebrow arcs above each eye -->
+        <path d="M 32 21 Q 38 18 44 22" fill="none"
+              stroke="#1a1a1a" stroke-width="1.6" stroke-linecap="round"/>
+        <path d="M 56 22 Q 62 18 68 21" fill="none"
+              stroke="#1a1a1a" stroke-width="1.6" stroke-linecap="round"/>
+
+        <!-- Eyes: perfect-round whites + circular pupils -->
         <g id="eye-left">
-          <ellipse cx="38" cy="32" rx="6.5" ry="7.5" fill="#fff" stroke="#1a1a1a" stroke-width="1.6"/>
-          <circle id="pupil-left" cx="38" cy="33" r="3.8" fill="#1a1a1a"/>
-          <circle cx="39.5" cy="31" r="1.3" fill="#fff"/>
-          <rect id="eyelid-left" x="31.5" y="24.5" width="13" height="0" fill="#FFD93D" stroke="#1a1a1a" stroke-width="0.8"/>
+          <circle cx="38" cy="32" r="7" fill="#fff" stroke="#1a1a1a" stroke-width="1.8"/>
+          <circle id="pupil-left" cx="38" cy="33" r="4" fill="#1a1a1a"/>
+          <circle cx="36" cy="31" r="1.6" fill="#fff"/>
+          <rect id="eyelid-left" x="31" y="24" width="14" height="0" fill="#FFD93D" stroke="#1a1a1a" stroke-width="0.9"/>
         </g>
         <g id="eye-right">
-          <ellipse cx="62" cy="32" rx="6.5" ry="7.5" fill="#fff" stroke="#1a1a1a" stroke-width="1.6"/>
-          <circle id="pupil-right" cx="62" cy="33" r="3.8" fill="#1a1a1a"/>
-          <circle cx="63.5" cy="31" r="1.3" fill="#fff"/>
-          <rect id="eyelid-right" x="55.5" y="24.5" width="13" height="0" fill="#FFD93D" stroke="#1a1a1a" stroke-width="0.8"/>
+          <circle cx="62" cy="32" r="7" fill="#fff" stroke="#1a1a1a" stroke-width="1.8"/>
+          <circle id="pupil-right" cx="62" cy="33" r="4" fill="#1a1a1a"/>
+          <circle cx="60" cy="31" r="1.6" fill="#fff"/>
+          <rect id="eyelid-right" x="55" y="24" width="14" height="0" fill="#FFD93D" stroke="#1a1a1a" stroke-width="0.9"/>
         </g>
-        <!-- Beak: split top/bot for quack animation -->
+
+        <!-- Beak: peach single shape; split as top/bot for quack animation -->
         <g id="beak">
-          <ellipse id="beak-top" cx="50" cy="46" rx="10" ry="3.6" fill="#FF8C00" stroke="#1a1a1a" stroke-width="1.5"/>
-          <ellipse id="beak-bot" cx="50" cy="50" rx="9.5" ry="3.4" fill="#E87A00" stroke="#1a1a1a" stroke-width="1.5"/>
+          <path id="beak-top"
+                d="M 41 42 Q 50 39 59 42 Q 59 47 50 47 Q 41 47 41 42 Z"
+                fill="#FF8C00" stroke="#1a1a1a" stroke-width="1.6" stroke-linejoin="round"/>
+          <path id="beak-bot"
+                d="M 41 47 Q 50 51 59 47 Q 57 50 50 51 Q 43 50 41 47 Z"
+                fill="#E87A00" stroke="#1a1a1a" stroke-width="1.6" stroke-linejoin="round"/>
         </g>
-        <!-- Bow tie at neck -->
+
+        <!-- Proper bow tie: curved triangles meeting at a centre knot -->
         <g id="bowtie">
-          <polygon points="50,60 42,55 42,68 50,64" fill="#1a1a1a"/>
-          <polygon points="50,60 58,55 58,68 50,64" fill="#1a1a1a"/>
-          <rect x="48" y="60.5" width="4" height="5" rx="0.6" fill="#1a1a1a"/>
+          <path d="M 50 62
+                   C 44 58, 40 58, 41 64
+                   C 40 68, 45 68, 50 65 Z"
+                fill="#1a1a1a"/>
+          <path d="M 50 62
+                   C 56 58, 60 58, 59 64
+                   C 60 68, 55 68, 50 65 Z"
+                fill="#1a1a1a"/>
+          <ellipse cx="50" cy="63.5" rx="2" ry="2.6" fill="#1a1a1a"/>
         </g>
       </svg>
       <div id="badge" class="badge">idle</div>
