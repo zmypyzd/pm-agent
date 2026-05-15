@@ -161,9 +161,14 @@ function scheduleBlink() {
   const wait = 2200 + Math.random() * 3200;
   setTimeout(() => {
     if (!$("pet").classList.contains("sleeping")) {
-      const lid = $("eyelid");
-      lid.classList.add("blink");
-      setTimeout(() => lid.classList.remove("blink"), 110);
+      const left = $("eyelid-left");
+      const right = $("eyelid-right");
+      left.classList.add("blink");
+      right.classList.add("blink");
+      setTimeout(() => {
+        left.classList.remove("blink");
+        right.classList.remove("blink");
+      }, 120);
     }
     scheduleBlink();
   }, wait);
@@ -244,26 +249,32 @@ function applyState(s) {
 }
 
 // ---------- Eye tracking ----------
-// Pupil moves a few px toward the cursor while the cursor is over the
-// pet window. Throttled implicitly by rAF since the inner write is cheap.
+// Both pupils glance toward the cursor independently, using each eye's
+// own centre so they don't both move in lockstep.
 function bindEyeTracking() {
-  const pupil = $("pupil");
-  if (!pupil) return;
+  const pl = $("pupil-left");
+  const pr = $("pupil-right");
+  if (!pl || !pr) return;
+  // SVG viewBox centres: left eye (38, 32), right eye (62, 32) → fractions
+  const EYES = [
+    { el: pl, fx: 0.38, fy: 0.32 },
+    { el: pr, fx: 0.62, fy: 0.32 },
+  ];
   document.addEventListener("mousemove", (e) => {
     const sleeping = $("pet").classList.contains("sleeping");
-    if (sleeping) { pupil.style.transform = ""; return; }
-    // Eye centre in the 100-unit SVG viewBox is (64, 29). The SVG sits
-    // inside a 120x120 px box, so the on-screen centre is at:
+    if (sleeping) { pl.style.transform = ""; pr.style.transform = ""; return; }
     const duck = $("duck").getBoundingClientRect();
-    const cx = duck.left + duck.width * 0.64;
-    const cy = duck.top + duck.height * 0.29;
-    const dx = e.clientX - cx;
-    const dy = e.clientY - cy;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    const max = 2.2;
-    const px = (dx / Math.max(dist, 1)) * Math.min(max, dist / 40);
-    const py = (dy / Math.max(dist, 1)) * Math.min(max, dist / 40);
-    pupil.style.transform = `translate(${px}px, ${py}px)`;
+    EYES.forEach(({ el, fx, fy }) => {
+      const cx = duck.left + duck.width * fx;
+      const cy = duck.top + duck.height * fy;
+      const dx = e.clientX - cx;
+      const dy = e.clientY - cy;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      const max = 2.4;
+      const px = (dx / Math.max(dist, 1)) * Math.min(max, dist / 40);
+      const py = (dy / Math.max(dist, 1)) * Math.min(max, dist / 40);
+      el.style.transform = `translate(${px}px, ${py}px)`;
+    });
   });
 }
 

@@ -12,27 +12,49 @@
       <div id="bubble" class="bubble hidden"></div>
       <div class="zz">Zz</div>
       <svg id="duck" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-        <ellipse cx="50" cy="68" rx="36" ry="22" fill="#FFD93D" stroke="#C99500" stroke-width="1.5"/>
-        <polygon points="14,62 22,58 22,68" fill="#FFD93D" stroke="#C99500" stroke-width="1.2"/>
+        <!-- Feet (back-bottom layer) -->
+        <ellipse cx="40" cy="92" rx="7" ry="4" fill="#FF8C00" stroke="#1a1a1a" stroke-width="1.6"/>
+        <ellipse cx="60" cy="92" rx="7" ry="4" fill="#FF8C00" stroke="#1a1a1a" stroke-width="1.6"/>
+        <!-- Lower body -->
+        <ellipse cx="50" cy="68" rx="32" ry="22" fill="#FFD93D" stroke="#1a1a1a" stroke-width="2"/>
+        <!-- Head -->
+        <circle cx="50" cy="32" r="26" fill="#FFD93D" stroke="#1a1a1a" stroke-width="2"/>
+        <!-- Tuft (head wisp) -->
+        <path d="M 47 5 Q 50 0 53 5 Q 52 9 50 9 Q 48 9 47 5 Z"
+              fill="#FFD93D" stroke="#1a1a1a" stroke-width="1.6"/>
+        <!-- Left arm/wing (static, mirror of right) -->
+        <path id="wing-left"
+              d="M 16 60 Q 11 68 17 80 Q 26 80 27 70 Q 24 62 16 60 Z"
+              fill="#FFD93D" stroke="#1a1a1a" stroke-width="1.8"/>
+        <!-- Right arm/wing (animated for flap state) -->
         <g id="wing" class="wing">
-          <ellipse cx="42" cy="68" rx="14" ry="9" fill="#F5C800" stroke="#A37C00" stroke-width="1"/>
-          <path d="M 30 68 Q 36 72 50 70" fill="none" stroke="#A37C00" stroke-width="0.8"/>
+          <path d="M 84 60 Q 89 68 83 80 Q 74 80 73 70 Q 76 62 84 60 Z"
+                fill="#FFD93D" stroke="#1a1a1a" stroke-width="1.8"/>
         </g>
-        <circle cx="58" cy="35" r="22" fill="#FFD93D" stroke="#C99500" stroke-width="1.5"/>
+        <!-- Eyes -->
+        <g id="eye-left">
+          <ellipse cx="38" cy="32" rx="6.5" ry="7.5" fill="#fff" stroke="#1a1a1a" stroke-width="1.6"/>
+          <circle id="pupil-left" cx="38" cy="33" r="3.8" fill="#1a1a1a"/>
+          <circle cx="39.5" cy="31" r="1.3" fill="#fff"/>
+          <rect id="eyelid-left" x="31.5" y="24.5" width="13" height="0" fill="#FFD93D" stroke="#1a1a1a" stroke-width="0.8"/>
+        </g>
+        <g id="eye-right">
+          <ellipse cx="62" cy="32" rx="6.5" ry="7.5" fill="#fff" stroke="#1a1a1a" stroke-width="1.6"/>
+          <circle id="pupil-right" cx="62" cy="33" r="3.8" fill="#1a1a1a"/>
+          <circle cx="63.5" cy="31" r="1.3" fill="#fff"/>
+          <rect id="eyelid-right" x="55.5" y="24.5" width="13" height="0" fill="#FFD93D" stroke="#1a1a1a" stroke-width="0.8"/>
+        </g>
+        <!-- Beak: split top/bot for quack animation -->
         <g id="beak">
-          <polygon id="beak-top" points="75,35 95,40 75,40" fill="#FF8C00" stroke="#A35F00" stroke-width="1"/>
-          <polygon id="beak-bot" points="75,40 95,40 75,44" fill="#E87A00" stroke="#A35F00" stroke-width="1"/>
+          <ellipse id="beak-top" cx="50" cy="46" rx="10" ry="3.6" fill="#FF8C00" stroke="#1a1a1a" stroke-width="1.5"/>
+          <ellipse id="beak-bot" cx="50" cy="50" rx="9.5" ry="3.4" fill="#E87A00" stroke="#1a1a1a" stroke-width="1.5"/>
         </g>
-        <g id="eye">
-          <ellipse id="eye-white" cx="64" cy="29" rx="4" ry="4" fill="#fff"/>
-          <circle id="pupil" cx="64" cy="29" r="3" fill="#1a1a1a"/>
-          <circle cx="65" cy="28" r="1" fill="#fff"/>
-          <rect id="eyelid" x="60" y="25" width="8" height="0" fill="#FFD93D" stroke="#C99500" stroke-width="0.5"/>
+        <!-- Bow tie at neck -->
+        <g id="bowtie">
+          <polygon points="50,60 42,55 42,68 50,64" fill="#1a1a1a"/>
+          <polygon points="50,60 58,55 58,68 50,64" fill="#1a1a1a"/>
+          <rect x="48" y="60.5" width="4" height="5" rx="0.6" fill="#1a1a1a"/>
         </g>
-        <polygon points="48,52 56,52 58,58 46,58" fill="#1a1a1a"/>
-        <polygon points="48,52 42,49 42,61 48,58" fill="#2c2c2c"/>
-        <polygon points="56,52 62,49 62,61 56,58" fill="#2c2c2c"/>
-        <circle cx="52" cy="55" r="1.2" fill="#FFD93D"/>
       </svg>
       <div id="badge" class="badge">idle</div>
       <div id="panel" class="panel hidden">
