@@ -148,6 +148,67 @@ async fn open_url(url: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+#[derive(Serialize, Clone, Debug)]
+struct DailySummary {
+    cycles: i64,
+    findings: i64,
+    prs_opened: i64,
+    total_cost_usd: f64,
+}
+
+// 24-hour rollup of cycles / findings / PRs / spend. Used by the
+// startup greeting bubble so the duck recaps activity each morning.
+// Falls back to zero on any failure (e.g. fresh install).
+fn read_daily_summary() -> Option<DailySummary> {
+    let path = state_db_path();
+    if !path.exists() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+
+    let (cycles, cost): (i64, f64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(cost_usd), 0)
+             FROM cycles
+             WHERE datetime(started_at) > datetime('now', '-1 day')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((0, 0.0));
+
+    let findings: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM findings
+             WHERE cycle_id IN (
+                 SELECT id FROM cycles
+                 WHERE datetime(started_at) > datetime('now', '-1 day')
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    let prs_opened: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM prs
+             WHERE datetime(created_at) > datetime('now', '-1 day')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    Some(DailySummary {
+        cycles,
+        findings,
+        prs_opened,
+        total_cost_usd: cost,
+    })
+}
+
 // JS calls this to grow/shrink the window when the mini panel is
 // shown/hidden. We keep this in Rust so the JS doesn't have to import
 // LogicalSize through the global tauri namespace (which varies by build).
@@ -198,6 +259,17 @@ pub fn run() {
                         last = Some(snap);
                     }
                     tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            });
+            // One-shot daily greeting: 2.5s after launch, if there's any
+            // activity in the last 24h, the duck recaps it.
+            let handle2 = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(2500)).await;
+                if let Some(s) = read_daily_summary() {
+                    if s.cycles > 0 || s.prs_opened > 0 {
+                        let _ = handle2.emit("pet-daily-summary", &s);
+                    }
                 }
             });
             Ok(())

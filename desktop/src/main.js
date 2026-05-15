@@ -307,6 +307,21 @@ window.addEventListener("DOMContentLoaded", async () => {
   } catch (err) {
     console.warn("pet-state subscribe failed:", err);
   }
+
+  // One-shot greeting with the last-24h roll-up. Emitted by Rust ~2.5s
+  // after launch when there's actually something to report.
+  try {
+    await listen("pet-daily-summary", (event) => {
+      const s = event.payload;
+      const cost = `$${s.total_cost_usd.toFixed(2)}`;
+      notify(
+        `24h: ${s.cycles}c · ${s.findings}f · ${s.prs_opened}p · ${cost}`,
+        { kind: "info", duration: 4500, pose: "happy" }
+      );
+    });
+  } catch (err) {
+    console.warn("pet-daily-summary subscribe failed:", err);
+  }
 });
 
 window.petSay = (text, opts) => notify(text, opts || {});
