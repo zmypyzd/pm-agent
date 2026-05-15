@@ -4,33 +4,67 @@ A multi-agent orchestrator that drives `claude -p` subprocesses toward a user-de
 
 **Status**: demo-ready (Day 14 of 14). 3/3 zero-incident dry-runs on the canonical `/health` goal (~50s wall, ~$0.35 each).
 
-**New here? → [`docs/QUICKSTART.md`](docs/QUICKSTART.md)** — 5-minute hands-on guide.
-
 **Stack**: Python 3.11 + Textual + git worktree + Claude Code CLI (`claude -p`).
 
 **Roles**: Planner / Coder (parallel) / Integration.
 
-## Quickstart
+## Install (one line)
 
 ```bash
-uv sync
+uv tool install git+https://github.com/zmypyzd/pm-agent
+```
 
+That's it. `pm-agent` is now a global command — no clone, no `cd`, no virtualenv.
+
+Prerequisites that pip can't bundle:
+
+| Tool | Install |
+|---|---|
+| `uv` | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+| Claude CLI | `npm i -g @anthropic-ai/claude-code` (then `claude` once to log in) |
+| `git` | macOS ships it; Linux `apt install git` |
+
+Upgrade later: `uv tool install git+https://github.com/zmypyzd/pm-agent --reinstall`.
+
+## 30-second demo
+
+```bash
+pm-agent demo
+```
+
+Zero flags. Creates `/tmp/pm-agent-day7-target` from scratch and runs the canonical
+`/health` endpoint goal end-to-end through the TUI (~50-100s, ~$0.35). Watch
+2 Coders work in parallel; integration merges + tests their diffs.
+
+**New here? → [`docs/QUICKSTART.md`](docs/QUICKSTART.md)** — the 5-minute hands-on guide.
+
+## Other entry points
+
+```bash
 # Mock TUI — visual only, free
-uv run python -m pm_agent.tui
+pm-agent tui
 
 # Interactive TUI — type goals in the input bar, run back-to-back
-uv run python -m pm_agent.tui --interactive --repo /tmp/pm-agent-day7-target
+pm-agent tui --interactive --repo /tmp/pm-agent-day7-target
 
-# Single Coder real run
-uv run python -m pm_agent.tui --single "say only the word four"
-
-# Full e2e (real Planner + 2 Coders + integration test)
-bash docs/demo-commands.sh full_e2e_dry_run
+# Autonomous bug-hunt loop daemon
+pm-agent loop preflight     # 30s readiness check
+pm-agent loop run           # start the daemon
+pm-agent loop report        # PR-style summary of the run
 
 # Three deterministic fault modes (no real LLM Coder calls)
-uv run python -m pm_agent.tui --repo /tmp/pm-agent-day7-target \
+pm-agent tui --repo /tmp/pm-agent-day7-target \
     --inject-fault planner-yaml "add /version endpoint"
 # also: --inject-fault coder-timeout | --inject-fault api-error
+```
+
+## Developing on this repo
+
+```bash
+git clone https://github.com/zmypyzd/pm-agent && cd pm-agent
+uv sync                                   # local venv with dev deps
+uv run pytest tests/                      # run the test suite
+uv run python -m pm_agent.tui             # run from source without install
 ```
 
 After a run:

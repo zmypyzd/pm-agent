@@ -16,6 +16,7 @@ from pm_agent.cli import (
     _nonneg_int_type,
     _path_expanduser,
     cmd_dashboard_serve,
+    cmd_demo,
     cmd_loop_run,
     main,
 )
@@ -177,6 +178,83 @@ def test_cmd_loop_run_keyboard_interrupt_returns_130():
     with patch.dict(sys.modules, {"pm_agent.loop": fake_loop_module}):
         rc = cmd_loop_run(args)
     assert rc == 130
+
+
+# ---- `pm-agent demo` zero-arg entrypoint ----
+
+def test_demo_listed_in_help():
+    """`pm-agent --help` mentions the demo subcommand."""
+    rc, out, err = _run_cli(["--help"])
+    text = out + err
+    assert "demo" in text
+
+
+def test_cmd_demo_dispatches_to_tui_with_canonical_argv(monkeypatch, tmp_path):
+    """cmd_demo: setup_demo_target then invoke tui_main with built argv.
+
+    Patches both setup + tui_main so the test doesn't touch /tmp/ or spawn
+    a real claude subprocess.
+    """
+    fake_target = tmp_path / "demo-target"
+    fake_target.mkdir()
+
+    setup_calls: list[bool] = []
+    captured_argv: list[list[str]] = []
+
+    def fake_setup(target: Path = fake_target) -> Path:
+        setup_calls.append(True)
+        return fake_target
+
+    def fake_tui_main() -> None:
+        captured_argv.append(list(sys.argv))
+
+    monkeypatch.setattr("pm_agent.demo.setup_demo_target", fake_setup)
+    monkeypatch.setattr("pm_agent.tui.main", fake_tui_main)
+
+    rc = cmd_demo(types.SimpleNamespace())
+    assert rc == 0
+    assert setup_calls == [True]
+    assert len(captured_argv) == 1
+    argv = captured_argv[0]
+    # Sanity: --repo points at the fake target; --coder-timeout + --test-cmd
+    # + the goal sentence are all forwarded.
+    assert "--repo" in argv
+    assert str(fake_target) in argv
+    assert "--coder-timeout" in argv
+    assert "--test-cmd" in argv
+    assert any("/health" in arg for arg in argv)
+
+
+def test_setup_demo_target_creates_repo(tmp_path):
+    """setup_demo_target writes server.py + test + inits git on master."""
+    from pm_agent import demo
+
+    target = tmp_path / "t"
+    result = demo.setup_demo_target(target)
+    assert result == target
+    assert (target / "server.py").exists()
+    assert (target / "tests" / "test_server.py").exists()
+    assert (target / "README.md").exists()
+    assert (target / ".git").is_dir()
+    # Branch is master (matches WorktreeManager default-branch detection).
+    import subprocess
+    branch = subprocess.run(
+        ["git", "-C", str(target), "rev-parse", "--abbrev-ref", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert branch == "master"
+
+
+def test_setup_demo_target_is_idempotent(tmp_path):
+    """Re-running setup wipes and recreates cleanly."""
+    from pm_agent import demo
+
+    target = tmp_path / "t"
+    demo.setup_demo_target(target)
+    (target / "leftover").write_text("stale")
+    demo.setup_demo_target(target)
+    assert not (target / "leftover").exists()
+    assert (target / "server.py").exists()
 
 
 # ---- R3-C-06: dashboard serve calls init_db ----

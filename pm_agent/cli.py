@@ -2,6 +2,7 @@
 
 Subcommands:
   pm-agent                       Legacy TUI (back-compat default).
+  pm-agent demo                  Zero-arg canonical /health demo (resets target).
   pm-agent tui [args]            Explicit TUI invocation; passes args through.
   pm-agent loop run [opts]       Start the autonomous-loop daemon.
   pm-agent loop status           Print current running cycle, if any.
@@ -193,6 +194,23 @@ def cmd_tui(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_demo(args: argparse.Namespace) -> int:
+    """Zero-arg canonical /health demo: reset target + run e2e via TUI."""
+    from pm_agent import demo
+    from pm_agent.tui import main as tui_main
+
+    target = demo.setup_demo_target()
+    print(f"[demo] target ready at {target}")
+
+    old_argv = sys.argv
+    sys.argv = demo.build_demo_tui_argv(target)
+    try:
+        tui_main()
+    finally:
+        sys.argv = old_argv
+    return 0
+
+
 def _build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser, argparse.ArgumentParser]:
     """Return (root_parser, loop_subparser, dashboard_subparser)."""
     ap = argparse.ArgumentParser(prog="pm-agent")
@@ -239,6 +257,12 @@ def _build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser, a
     p_tui.add_argument("tui_args", nargs=argparse.REMAINDER,
                        help="args passed through to pm_agent.tui")
 
+    # demo
+    sub.add_parser(
+        "demo",
+        help="zero-arg canonical /health demo (resets /tmp/pm-agent-day7-target)",
+    )
+
     return ap, p_loop, p_dash
 
 
@@ -268,6 +292,8 @@ def main() -> int:
         return 2
     if args.cmd == "tui":
         return cmd_tui(args)
+    if args.cmd == "demo":
+        return cmd_demo(args)
     ap.print_help()
     return 2
 
