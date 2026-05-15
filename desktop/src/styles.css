@@ -28,15 +28,35 @@ body:active {
   animation: bob 2.4s ease-in-out infinite;
 }
 
+.pet.squish {
+  animation: squish 0.32s ease-out;
+}
+
 @keyframes bob {
   0%, 100% { transform: translateY(0); }
   50%      { transform: translateY(-3px); }
+}
+
+@keyframes squish {
+  0%, 100% { transform: scale(1, 1) translateY(0); }
+  35%      { transform: scale(1.08, 0.86) translateY(2px); }
+  70%      { transform: scale(0.96, 1.06) translateY(-2px); }
 }
 
 #duck {
   width: 120px;
   height: 120px;
   pointer-events: none;
+  transition: transform 0.18s ease-out;
+}
+
+#eyelid {
+  transition: height 0.08s ease-in-out;
+  transform-origin: center;
+}
+
+#eyelid.blink {
+  height: 8px;
 }
 
 .badge {
@@ -50,7 +70,45 @@ body:active {
   background: rgba(60, 60, 67, 0.85);
   pointer-events: none;
   white-space: nowrap;
+  transition: background 0.2s;
 }
 
 .badge.running { background: rgba(50, 130, 255, 0.92); }
 .badge.error   { background: rgba(220, 70, 70, 0.92); }
+.badge.success { background: rgba(60, 180, 100, 0.92); }
+
+.bubble {
+  position: absolute;
+  bottom: 36px;
+  left: 50%;
+  transform: translateX(-50%) translateY(0);
+  padding: 6px 12px;
+  border-radius: 10px;
+  background: #fff;
+  color: #1a1a1a;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro", sans-serif;
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18), 0 0 0 0.5px rgba(0, 0, 0, 0.05);
+  opacity: 1;
+  transition: opacity 0.25s, transform 0.25s;
+}
+
+.bubble::after {
+  content: "";
+  position: absolute;
+  bottom: -5px;
+  left: 50%;
+  transform: translateX(-50%) rotate(45deg);
+  width: 8px;
+  height: 8px;
+  background: #fff;
+  box-shadow: 1px 1px 1.5px rgba(0, 0, 0, 0.08);
+}
+
+.bubble.hidden {
+  opacity: 0;
+  transform: translateX(-50%) translateY(6px);
+}

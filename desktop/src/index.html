@@ -9,13 +9,18 @@
   </head>
   <body>
     <div id="pet" class="pet" title="pm-agent — drag to move, right-click for menu">
+      <div id="bubble" class="bubble hidden"></div>
       <svg id="duck" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
         <ellipse cx="50" cy="68" rx="36" ry="22" fill="#FFD93D" stroke="#C99500" stroke-width="1.5"/>
         <polygon points="14,62 22,58 22,68" fill="#FFD93D" stroke="#C99500" stroke-width="1.2"/>
         <circle cx="58" cy="35" r="22" fill="#FFD93D" stroke="#C99500" stroke-width="1.5"/>
         <polygon points="75,35 95,40 75,44" fill="#FF8C00" stroke="#A35F00" stroke-width="1"/>
-        <circle cx="64" cy="29" r="3.5" fill="#1a1a1a"/>
-        <circle cx="65" cy="28" r="1.2" fill="#fff"/>
+        <g id="eye">
+          <ellipse id="eye-white" cx="64" cy="29" rx="4" ry="4" fill="#fff"/>
+          <circle id="pupil" cx="64" cy="29" r="3" fill="#1a1a1a"/>
+          <circle cx="65" cy="28" r="1" fill="#fff"/>
+          <rect id="eyelid" x="60" y="25" width="8" height="0" fill="#FFD93D" stroke="#C99500" stroke-width="0.5"/>
+        </g>
         <polygon points="48,52 56,52 58,58 46,58" fill="#1a1a1a"/>
         <polygon points="48,52 42,49 42,61 48,58" fill="#2c2c2c"/>
         <polygon points="56,52 62,49 62,61 56,58" fill="#2c2c2c"/>
