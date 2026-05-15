@@ -52,6 +52,12 @@ function renderBubble(text, kind) {
   const b = $("bubble");
   b.textContent = text;
   b.className = "bubble " + (kind || "");
+  // Quack: brief mouth-open animation aligned with bubble appearance.
+  const pet = $("pet");
+  pet.classList.remove("quacking");
+  void pet.offsetWidth;
+  pet.classList.add("quacking");
+  setTimeout(() => pet.classList.remove("quacking"), 280);
 }
 
 function hideBubble() {

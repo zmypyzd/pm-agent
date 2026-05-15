@@ -102,6 +102,23 @@ body:active {
   50%      { transform: translate(4px, -6px); opacity: 0.9; }
 }
 
+#beak-top, #beak-bot {
+  transform-origin: 75px 40px;
+  transform-box: fill-box;
+  transition: transform 0.18s ease-out;
+}
+
+.pet.quacking #beak-top { transform: translateY(-2px) rotate(-3deg); }
+.pet.quacking #beak-bot { transform: translateY(2px) rotate(3deg); }
+
+#pupil {
+  transition: transform 0.2s ease-out;
+}
+
+#pupil.glance-r { transform: translate(2px, -1px); }
+#pupil.glance-l { transform: translate(-2px, -1px); }
+#pupil.glance-u { transform: translate(0, -2px); }
+
 .bubble.success { background: #e6f7ec; color: #14532d; }
 .bubble.success::after { background: #e6f7ec; }
 .bubble.warn    { background: #fff4e0; color: #7a3f00; }
