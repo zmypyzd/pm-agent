@@ -12,27 +12,6 @@
       <div id="bubble" class="bubble hidden"></div>
       <div class="zz">Zz</div>
       <img id="duck" src="assets/duck.png" alt="" draggable="false"/>
-      <!-- Overlay layer for animations that the painted PNG can't do
-           on its own (blink + sleep). Positions are tuned to land
-           exactly on the painted eyes in duck.png. -->
-      <svg class="duck-overlay" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-        <!-- Eyelid covers sized to fully hide the painted eyes when
-             opacity = 1. Positions tuned against duck.png:
-             left eye centre ~ (33, 33), right ~ (58, 33). The yellow
-             fill matches the body's #FFD93D so the cover reads as
-             closed eyelid skin. -->
-        <ellipse id="eyelid-cover-left"  cx="33" cy="33" rx="5.2" ry="6"
-                 fill="#FFD93D" stroke="#1a1a1a" stroke-width="1.5" opacity="0"/>
-        <ellipse id="eyelid-cover-right" cx="58" cy="33" rx="5.2" ry="6"
-                 fill="#FFD93D" stroke="#1a1a1a" stroke-width="1.5" opacity="0"/>
-        <!-- Closed-eye smile lines drawn over the covers -->
-        <path id="closed-eye-left"
-              d="M 28 33 Q 33 36 38 33" opacity="0"
-              fill="none" stroke="#1a1a1a" stroke-width="2.2" stroke-linecap="round"/>
-        <path id="closed-eye-right"
-              d="M 53 33 Q 58 36 63 33" opacity="0"
-              fill="none" stroke="#1a1a1a" stroke-width="2.2" stroke-linecap="round"/>
-      </svg>
       <div id="badge" class="badge">idle</div>
       <div id="panel" class="panel hidden">
         <div class="panel-header">

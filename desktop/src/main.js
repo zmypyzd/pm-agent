@@ -157,17 +157,9 @@ function escapeHtml(s) {
 }
 
 // ---------- Idle behaviours ----------
-function scheduleBlink() {
-  const wait = 2200 + Math.random() * 3200;
-  setTimeout(() => {
-    const pet = $("pet");
-    if (!pet.classList.contains("sleeping")) {
-      pet.classList.add("blinking");
-      setTimeout(() => pet.classList.remove("blinking"), 140);
-    }
-    scheduleBlink();
-  }, wait);
-}
+// Blink removed: covering the painted PNG eyes with a yellow eyelid
+// ellipse looked off no matter how we tuned the position. The duck
+// just keeps its painted expression.
 
 function welcomeHint() {
   setTimeout(() => notify("点鸭子看记录 · 右键看菜单", { duration: 3200, silent: true }), 800);
@@ -248,7 +240,6 @@ function applyState(s) {
 // artifact. Path B chose the PNG's polish over the live-glance effect.
 
 window.addEventListener("DOMContentLoaded", async () => {
-  scheduleBlink();
   welcomeHint();
 
   // Delegate panel-history clicks → open URL.

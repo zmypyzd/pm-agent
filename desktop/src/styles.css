@@ -226,34 +226,6 @@ body:active {
   display: block;
 }
 
-/* Animation overlay layer (eyelid covers + closed-eye lines).
-   Same 120×120 footprint, sits exactly on top of the PNG. */
-.duck-overlay {
-  position: absolute;
-  top: 0;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 120px;
-  height: 120px;
-  pointer-events: none;
-}
-
-#eyelid-cover-left, #eyelid-cover-right,
-#closed-eye-left, #closed-eye-right {
-  transition: opacity 0.07s ease-in-out;
-}
-
-.pet.blinking #eyelid-cover-left,
-.pet.blinking #eyelid-cover-right,
-.pet.sleeping #eyelid-cover-left,
-.pet.sleeping #eyelid-cover-right,
-.pet.blinking #closed-eye-left,
-.pet.blinking #closed-eye-right,
-.pet.sleeping #closed-eye-left,
-.pet.sleeping #closed-eye-right {
-  opacity: 1;
-}
-
 /* Running cycle: gentle whole-body wobble (instead of trying to
    animate the painted wing). The PNG bobs back and forth. */
 .pet.flapping #duck {
