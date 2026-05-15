@@ -11,9 +11,13 @@ const EXPANDED = { w: 220, h: 320 };
 
 // ---------- Event history (drives the mini panel) ----------
 const history = [];
-function pushHistory(text, kind) {
-  history.push({ at: new Date(), text, kind: kind || "info" });
+function pushHistory(text, kind, url) {
+  history.push({ at: new Date(), text, kind: kind || "info", url: url || null });
   if (history.length > 30) history.shift();
+}
+
+async function openUrl(url) {
+  try { await invoke("open_url", { url }); } catch (err) { console.error(err); }
 }
 
 // ---------- Notification queue ----------
@@ -28,8 +32,9 @@ function notify(text, opts = {}) {
     kind: opts.kind || "info",
     pose: opts.pose || null,
     silent: !!opts.silent,
+    url: opts.url || null,
   };
-  if (!item.silent) pushHistory(text, item.kind);
+  if (!item.silent) pushHistory(text, item.kind, item.url);
   if (opts.priority === "high") {
     queue.unshift(item);
     if (queueRunning && currentTimer) {
@@ -50,7 +55,7 @@ function runQueue() {
   }
   queueRunning = true;
   const n = queue.shift();
-  renderBubble(n.text, n.kind);
+  renderBubble(n.text, n.kind, n.url);
   if (n.pose) triggerPose(n.pose);
   currentTimer = setTimeout(() => {
     hideBubble();
@@ -58,10 +63,15 @@ function runQueue() {
   }, n.duration);
 }
 
-function renderBubble(text, kind) {
+function renderBubble(text, kind, url) {
   const b = $("bubble");
   b.textContent = text;
   b.className = "bubble " + (kind || "");
+  b.onclick = null;
+  if (url) {
+    b.classList.add("clickable");
+    b.onclick = (e) => { e.stopPropagation(); openUrl(url); };
+  }
   const pet = $("pet");
   pet.classList.remove("quacking");
   void pet.offsetWidth;
@@ -125,9 +135,10 @@ function renderPanel() {
   } else {
     history.slice().reverse().forEach((h) => {
       const li = document.createElement("li");
-      li.className = h.kind || "";
+      li.className = (h.kind || "") + (h.url ? " clickable" : "");
       const t = h.at.toTimeString().slice(0, 5);
       li.innerHTML = `<span class="t">${t}</span><span>${escapeHtml(h.text)}</span>`;
+      if (h.url) li.dataset.url = h.url;
       list.appendChild(li);
     });
   }
@@ -202,7 +213,10 @@ function applyState(s) {
       });
     } else if (s.open_prs > prev.open_prs) {
       const d = s.open_prs - prev.open_prs;
-      notify(d === 1 ? "+1 PR opened" : `+${d} PRs opened`, { kind: "success" });
+      const label = s.latest_pr_number
+        ? (d === 1 ? `PR #${s.latest_pr_number} opened` : `+${d} PRs, newest #${s.latest_pr_number}`)
+        : (d === 1 ? "+1 PR opened" : `+${d} PRs opened`);
+      notify(label, { kind: "success", url: s.latest_pr_url || null });
     } else if (s.findings_in_cycle > prev.findings_in_cycle && s.findings_in_cycle >= 5) {
       notify(`${s.findings_in_cycle} findings this cycle`, { kind: "warn" });
     }
@@ -229,9 +243,43 @@ function applyState(s) {
   if (panelOpen) renderPanel();
 }
 
+// ---------- Eye tracking ----------
+// Pupil moves a few px toward the cursor while the cursor is over the
+// pet window. Throttled implicitly by rAF since the inner write is cheap.
+function bindEyeTracking() {
+  const pupil = $("pupil");
+  if (!pupil) return;
+  document.addEventListener("mousemove", (e) => {
+    const sleeping = $("pet").classList.contains("sleeping");
+    if (sleeping) { pupil.style.transform = ""; return; }
+    // Eye centre in the 100-unit SVG viewBox is (64, 29). The SVG sits
+    // inside a 120x120 px box, so the on-screen centre is at:
+    const duck = $("duck").getBoundingClientRect();
+    const cx = duck.left + duck.width * 0.64;
+    const cy = duck.top + duck.height * 0.29;
+    const dx = e.clientX - cx;
+    const dy = e.clientY - cy;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const max = 2.2;
+    const px = (dx / Math.max(dist, 1)) * Math.min(max, dist / 40);
+    const py = (dy / Math.max(dist, 1)) * Math.min(max, dist / 40);
+    pupil.style.transform = `translate(${px}px, ${py}px)`;
+  });
+}
+
 window.addEventListener("DOMContentLoaded", async () => {
   scheduleBlink();
+  bindEyeTracking();
   welcomeHint();
+
+  // Delegate panel-history clicks → open URL.
+  $("panel-history").addEventListener("click", (e) => {
+    const li = e.target.closest("li");
+    if (li && li.dataset.url) {
+      e.stopPropagation();
+      openUrl(li.dataset.url);
+    }
+  });
 
   const body = document.body;
 

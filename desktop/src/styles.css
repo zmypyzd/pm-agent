@@ -126,6 +126,26 @@ body:active {
 .bubble.error   { background: #fde3e3; color: #7a0c0c; }
 .bubble.error::after   { background: #fde3e3; }
 
+.bubble.clickable {
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: rgba(0, 0, 0, 0.25);
+  text-underline-offset: 2px;
+}
+
+.bubble.clickable:hover {
+  filter: brightness(1.03);
+}
+
+.panel-history li.clickable {
+  cursor: pointer;
+}
+
+.panel-history li.clickable:hover {
+  background: rgba(0, 0, 0, 0.04);
+  border-radius: 4px;
+}
+
 /* Mini panel — shown on left-click. Sits below the duck, lives in the
    window's expanded 220x320 slot. */
 .panel {

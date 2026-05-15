@@ -47,6 +47,8 @@ struct StateSnapshot {
     cumulative_cost_usd: f64,
     findings_in_cycle: i64,
     open_prs: i64,
+    latest_pr_url: Option<String>,
+    latest_pr_number: Option<i64>,
 }
 
 impl StateSnapshot {
@@ -58,6 +60,8 @@ impl StateSnapshot {
             cumulative_cost_usd: 0.0,
             findings_in_cycle: 0,
             open_prs: 0,
+            latest_pr_url: None,
+            latest_pr_number: None,
         }
     }
 }
@@ -114,6 +118,15 @@ fn read_state() -> StateSnapshot {
         )
         .unwrap_or(0);
 
+    let (latest_pr_number, latest_pr_url): (Option<i64>, Option<String>) = conn
+        .query_row(
+            "SELECT github_number, url FROM prs WHERE state = 'open' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map(|(n, u)| (Some(n), Some(u)))
+        .unwrap_or((None, None));
+
     StateSnapshot {
         db_exists: true,
         cycle_id: latest.as_ref().map(|(id, _)| *id),
@@ -121,7 +134,18 @@ fn read_state() -> StateSnapshot {
         cumulative_cost_usd: cumulative_cost,
         findings_in_cycle,
         open_prs,
+        latest_pr_url,
+        latest_pr_number,
     }
+}
+
+#[tauri::command]
+async fn open_url(url: String) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg(&url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 // JS calls this to grow/shrink the window when the mini panel is
@@ -159,7 +183,7 @@ pub fn run() {
         // ~/Library/Application Support/<bundle id>/window-state.json.
         // Restores on next start with no extra code.
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .invoke_handler(tauri::generate_handler![show_menu, set_window_size])
+        .invoke_handler(tauri::generate_handler![show_menu, set_window_size, open_url])
         .setup(|app| {
             // State polling: emit only on change so the frontend doesn't
             // re-render at 0.5 Hz for nothing. 2s cadence is well below
