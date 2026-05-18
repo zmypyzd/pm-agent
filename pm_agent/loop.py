@@ -452,21 +452,41 @@ async def run_one_cycle(
         _ensure_finished("aborted")
 
 
-async def run_forever(repo: Path, cfg: LoopConfig | None = None) -> None:
-    """Daemon entry point. Installs SIGINT/SIGTERM handlers; loops cycles."""
+async def run_forever(
+    repo: Path,
+    cfg: LoopConfig | None = None,
+    *,
+    install_signal_handlers: bool = True,
+    skip_init: bool = False,
+    skip_reconcile: bool = False,
+    stop_event: asyncio.Event | None = None,
+) -> None:
+    """Daemon entry point. Installs SIGINT/SIGTERM handlers; loops cycles.
+
+    New kwargs (all default to preserving prior behavior):
+      install_signal_handlers: when False, do not call loop.add_signal_handler
+        (callers like the TUI manage their own signal handling).
+      skip_init: when True, do not call persistence.init_db (caller has).
+      skip_reconcile: when True, do not call persistence.reconcile (caller has).
+      stop_event: external Event to use; if None, a fresh one is created.
+    """
     cfg = cfg or LoopConfig()
     state_db = STATE_DB
-    persistence.init_db(state_db)
-    report = persistence.reconcile(repo)
-    log.info("reconcile: %s", report)
+    if not skip_init:
+        persistence.init_db(state_db)
+    if not skip_reconcile:
+        report = persistence.reconcile(repo)
+        log.info("reconcile: %s", report)
 
-    stop_event = asyncio.Event()
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop_event.set)
-        except NotImplementedError:
-            pass  # Windows doesn't support signal handlers in asyncio
+    if stop_event is None:
+        stop_event = asyncio.Event()
+    if install_signal_handlers:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop_event.set)
+            except NotImplementedError:
+                pass  # Windows doesn't support signal handlers in asyncio
 
     while not stop_event.is_set():
         try:

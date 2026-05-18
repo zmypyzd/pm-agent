@@ -32,11 +32,9 @@ import argparse
 import asyncio
 import os
 import subprocess
-import sys
 import time
 import uuid
-from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime as _dt_datetime, timedelta, timezone as _dt_timezone
 from pathlib import Path
 
 from rich.markup import escape as _rich_escape
@@ -44,12 +42,250 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.screen import Screen
 from textual.widgets import DataTable, Input, Label, ProgressBar, RichLog, Static
 
 from pm_agent.planner import PlannerError, plan
 from pm_agent.runner import run_claude_async
 from pm_agent.tasks import CoderTask
 from pm_agent.worktree import IntegrationResult, WorktreeManager
+
+import collections
+import logging as _logging  # avoid clashing with the existing `log` variable used in this module
+import signal
+import sqlite3
+
+
+
+class TUILogHandler(_logging.Handler):
+    """Bridge stdlib logging → Textual RichLog, thread-safe.
+
+    emit() may be called from any thread (e.g. asyncio.to_thread workers).
+    It schedules _dispatch on the main event loop via call_soon_threadsafe,
+    where it is safe to touch the buffer and Screen widgets.
+    """
+
+    def __init__(self, loop, buffer, app):
+        super().__init__()
+        self._loop = loop
+        self._buffer = buffer
+        self._app = app
+
+    def emit(self, record: _logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+        except Exception:
+            self.handleError(record)
+            return
+        self._loop.call_soon_threadsafe(self._dispatch, msg)
+
+    def _dispatch(self, msg: str) -> None:
+        """Runs on the main event loop thread."""
+        self._buffer.append(msg)
+        screen = self._app.screen_stack[-1] if self._app.screen_stack else None
+        if isinstance(screen, DaemonScreen):
+            screen.append_log_line(msg)
+
+
+class DbPoller:
+    """Polls SQLite on two cadences. Each tick wraps a sync query in
+    asyncio.to_thread; queries run on the default executor (≤32 workers,
+    each with its own thread-local SQLite connection)."""
+
+    LIVE_INTERVAL = 1.0
+    PRS_INTERVAL = 30.0
+    LIVE_TIMEOUT = 2.0
+    PRS_TIMEOUT = 10.0
+
+    def __init__(self, app):
+        self._app = app
+        self._live_task = None
+        self._prs_task = None
+
+    def start(self) -> None:
+        self._live_task = asyncio.create_task(self._loop_live(), name="db-poller-live")
+        self._prs_task = asyncio.create_task(self._loop_prs(),  name="db-poller-prs")
+
+    def stop(self) -> None:
+        for t in (self._live_task, self._prs_task):
+            if t is not None and not t.done():
+                t.cancel()
+
+    async def tick_once(self) -> None:
+        """Run one live + prs query immediately. Used by Screen resume."""
+        from pm_agent import persistence_queries as _q
+        live = await asyncio.wait_for(
+            asyncio.to_thread(_q.live_cycle), timeout=self.LIVE_TIMEOUT)
+        screen = self._current_daemon_screen()
+        if screen is not None:
+            screen.update_cycle_and_findings(live)
+        prs = await asyncio.wait_for(
+            asyncio.to_thread(_q.recent_prs_24h), timeout=self.PRS_TIMEOUT)
+        if screen is not None:
+            screen.update_prs(prs)
+
+    def _current_daemon_screen(self):
+        if not self._app.screen_stack:
+            return None
+        top = self._app.screen_stack[-1]
+        return top if isinstance(top, DaemonScreen) else None
+
+    async def _loop_live(self):
+        from pm_agent import persistence_queries as _q
+        while True:
+            try:
+                data = await asyncio.wait_for(
+                    asyncio.to_thread(_q.live_cycle), timeout=self.LIVE_TIMEOUT)
+                screen = self._current_daemon_screen()
+                if screen is not None:
+                    screen.update_cycle_and_findings(data)
+            except asyncio.CancelledError:
+                raise
+            except sqlite3.OperationalError as e:
+                _logging.getLogger(__name__).warning("db poll (live) failed: %s", e)
+            except asyncio.TimeoutError:
+                _logging.getLogger(__name__).warning("db poll (live) timeout")
+            except Exception:
+                _logging.getLogger(__name__).exception("db poller live tick crashed")
+            await asyncio.sleep(self.LIVE_INTERVAL)
+
+    async def _loop_prs(self):
+        from pm_agent import persistence_queries as _q
+        while True:
+            try:
+                data = await asyncio.wait_for(
+                    asyncio.to_thread(_q.recent_prs_24h), timeout=self.PRS_TIMEOUT)
+                screen = self._current_daemon_screen()
+                if screen is not None:
+                    screen.update_prs(data)
+            except asyncio.CancelledError:
+                raise
+            except sqlite3.OperationalError as e:
+                _logging.getLogger(__name__).warning("db poll (prs) failed: %s", e)
+            except asyncio.TimeoutError:
+                _logging.getLogger(__name__).warning("db poll (prs) timeout")
+            except Exception:
+                _logging.getLogger(__name__).exception("db poller prs tick crashed")
+            await asyncio.sleep(self.PRS_INTERVAL)
+
+
+class PreflightBar(Static):
+    """One-row, seven-cell preflight status bar."""
+
+    DEFAULT_CSS = """
+    PreflightBar {
+        height: 1;
+        background: $panel;
+        padding: 0 1;
+    }
+    """
+
+    _markup: str = ""
+
+    @property
+    def renderable(self) -> str:
+        """Return the raw markup string; str(bar.renderable) includes color tags."""
+        return self._markup
+
+    def update_from(self, results) -> None:
+        """Replace bar content with rendered cells.
+
+        `results` is the list returned by `preflight.run_preflight(...)[0]`.
+        """
+        cells = []
+        for r in results:
+            if r.ok:
+                symbol, color = "✓", "green"
+            elif r.warn_only:
+                symbol, color = "⚠", "yellow"
+            else:
+                symbol, color = "✗", "red"
+            # Shorten name to ≤14 chars to keep 7 cells on one row
+            short = (
+                r.name
+                .replace("state.db ", "db ")
+                .replace("repo on main", "main")
+                .replace("claude CLI on PATH", "claude")
+                .replace("gh CLI authenticated", "gh")
+            )
+            cells.append(f"[{color}]{symbol} {short}[/]")
+        self._markup = " │ ".join(cells)
+        self.update(self._markup)
+
+
+class CycleSummaryRow(Static):
+    """One-row cycle summary above the Findings/PR tables."""
+
+    DEFAULT_CSS = """
+    CycleSummaryRow {
+        height: 1;
+        background: $boost;
+        padding: 0 1;
+    }
+    """
+
+    _last_error: object | None = None
+    _markup: str = ""
+
+    @property
+    def renderable(self):
+        """Test-friendly access to the raw Rich markup string.
+
+        Textual 8.2.5's Static does not expose .renderable on unmounted
+        widgets; the property here lets unit tests assert on the markup
+        without mounting the widget into an App.
+        """
+        return self._markup
+
+    def set_last_error(self, err) -> None:
+        self._last_error = err
+
+    def clear_last_error(self) -> None:
+        self._last_error = None
+
+    def update_from(self, payload) -> None:
+        if self._last_error is not None:
+            reason = _rich_escape(str(self._last_error))[:80]
+            self._markup = (
+                f"[red]daemon crashed:[/] {reason}  "
+                f"[grey50]press 's' to restart[/]"
+            )
+        elif payload.status == "idle":
+            lf = payload.last_finished
+            if lf is None:
+                self._markup = (
+                    "[grey50]daemon idle — press 's' to start "
+                    "(no prior cycle)[/]"
+                )
+            else:
+                when = lf.finished_at or lf.started_at
+                short = when.split("T")[1][:5] if "T" in when else when
+                self._markup = (
+                    f"[grey50]idle[/]  last cycle [bold]#{lf.id}[/] "
+                    f"{lf.status}  ${lf.cost_usd:.4f}  at {short}"
+                )
+        else:
+            c = payload.cycle
+            elapsed = self._fmt_elapsed(c.started_at)
+            self._markup = (
+                f"cycle [bold]#{c.id}[/]  [yellow]{c.status}[/]  "
+                f"PR opened [green]{c.findings_pr_opened}[/]/"
+                f"{c.findings_total}  "
+                f"${c.cost_usd:.4f}  elapsed {elapsed}"
+            )
+        self.update(self._markup)
+
+    @staticmethod
+    def _fmt_elapsed(started_at: str) -> str:
+        try:
+            t0 = _dt_datetime.fromisoformat(started_at)
+            if t0.tzinfo is None:
+                t0 = t0.replace(tzinfo=_dt_timezone.utc)
+            secs = int((_dt_datetime.now(_dt_timezone.utc) - t0).total_seconds())
+            return f"{secs}s" if secs < 60 else f"{secs // 60}m{secs % 60}s"
+        except ValueError:
+            return started_at
+
 
 GOAL_MOCK = "Add room invite link API to werewolf platform (mock)"
 
@@ -172,8 +408,15 @@ def mock_planner_decompose(goal: str) -> list[CoderTask]:
     ]
 
 
-class PMAgentTUI(App):
-    """Day-5 — multi-coder via git worktree + asyncio.gather."""
+class GoalScreen(Screen):
+    """Day-5 — multi-coder via git worktree + asyncio.gather.
+
+    Task 10 (TUI daemon extension): extracted from the prior
+    ``PMAgentTUI(App)`` into a ``Screen`` so that the App-level shell
+    (added in Task 12) can host both this goal-mode UI and the
+    upcoming ``DaemonScreen``. ``PMAgentTUI`` remains as a temporary
+    module-level alias to this class until Task 12 lands the real App.
+    """
 
     CSS = """
     Screen { layout: vertical; }
@@ -237,8 +480,8 @@ class PMAgentTUI(App):
     }
     """
 
+    # Task 10: q/quit lives on the App in Task 12, not on the Screen.
     BINDINGS = [
-        ("q", "quit", "Quit"),
         ("r", "rerun", "Re-run"),
         ("n", "focus_input", "New goal"),
         ("escape", "blur_input", ""),
@@ -1143,10 +1386,37 @@ class PMAgentTUI(App):
         for name, status, action in AGENTS_INITIAL:
             self._set_agent_status(name, status, action)
 
+    def on_screen_resume(self) -> None:
+        """Refresh disable state when switching back to goal mode.
+
+        Task 10: wired against ``self.app.is_daemon_active`` once the real
+        App lands in Task 12. We use ``getattr`` so the interim
+        ``PMAgentTUI = GoalScreen`` alias (which has no daemon state) and
+        plain ``Screen.run_test()`` harnesses don't blow up.
+        """
+        from textual.css.query import NoMatches
+        try:
+            input_w = self.query_one("#goal-input", Input)
+        except NoMatches:
+            return  # not yet mounted / wrong screen
+        is_active = getattr(self.app, "is_daemon_active", False)
+        if is_active:
+            input_w.disabled = True
+            input_w.placeholder = "(locked — daemon running)"
+        else:
+            input_w.disabled = False
+            input_w.placeholder = "type a goal and press Enter"
+
     def action_rerun(self) -> None:
         """Re-run the session. Mock mode resets the ticker; real mode reruns
         the planner + coders + integration. Refuses if a real-mode session is
         still in flight (press q to abort first)."""
+        # Task 10: daemon mode (added in Task 11/12) takes exclusive control
+        # of subprocess scheduling, so disable goal-mode re-runs while it is
+        # active. ``getattr`` keeps this safe before the real App lands.
+        if getattr(self.app, "is_daemon_active", False):
+            self.notify("daemon running; goal mode locked", severity="warning")
+            return
         if self.is_mock:
             self._tick_counter = 0
             self._tasks_done = 0
@@ -1231,6 +1501,258 @@ class PMAgentTUI(App):
         self.set_focus(None)
 
 
+# Names must match preflight.py CheckResult.name strings verbatim.
+# Verified 2026-05-18 against preflight.py:40,72,119,160,195,241,276.
+HARD_CHECK_NAMES = {
+    "state.db dir writable",
+    "claude CLI on PATH",
+    "gh CLI authenticated",
+    "repo clean",
+    "/tmp writable",
+}
+# Excluded deliberately:
+#   "state.db clean" — hard-fails on any prior cycle; we demote to soft-warn.
+#   "repo on main"   — already warn_only=True in preflight.
+
+
+class DaemonScreen(Screen):
+    BINDINGS = [
+        ("s",      "start_daemon",  "Start"),
+        ("x",      "stop_daemon",   "Stop"),
+        ("p",      "preflight",     "Re-preflight"),
+        ("R",      "focus_repo",    "Set repo"),
+        ("escape", "blur_input",    ""),
+    ]
+
+    DEFAULT_CSS = """
+    DaemonScreen { layout: vertical; }
+    #cycle-row { height: 1; }
+    #main { height: 1fr; }
+    #left {
+        width: 50%;
+        height: 100%;
+        border: solid $secondary;
+    }
+    #daemon-log {
+        width: 1fr;
+        height: 100%;
+        border: solid $secondary;
+    }
+    #repo-input {
+        height: 3;
+        background: $surface;
+        border: solid $accent;
+    }
+    """
+
+    def compose(self):
+        yield PreflightBar(id="preflight-bar")
+        yield CycleSummaryRow(id="cycle-row")
+        with Horizontal(id="main"):
+            with Vertical(id="left"):
+                yield Static("Findings (current cycle)", classes="panel-title")
+                yield DataTable(id="findings", zebra_stripes=True)
+                yield Static("Recent PRs (24h)", classes="panel-title")
+                yield DataTable(id="prs", zebra_stripes=True)
+            yield RichLog(id="daemon-log", wrap=True, highlight=True,
+                          markup=True, max_lines=5000)
+        yield Input(placeholder="repo path (press R to focus)", id="repo-input")
+
+    def on_mount(self) -> None:
+        from textual.css.query import NoMatches
+        try:
+            ftable = self.query_one("#findings", DataTable)
+            ftable.add_columns("bug_id", "severity", "status", "title")
+        except NoMatches:
+            pass
+        try:
+            ptable = self.query_one("#prs", DataTable)
+            ptable.add_columns("#", "state", "bug_id", "title")
+        except NoMatches:
+            pass
+        # Kick off preflight in the background; do not block on_mount
+        asyncio.create_task(self._run_preflight_async())
+
+    async def _run_preflight_async(self) -> None:
+        from pm_agent import preflight as _pf
+        from pm_agent.preflight import CheckResult
+        from pm_agent.loop import STATE_DB
+        try:
+            results, _ = await asyncio.to_thread(
+                _pf.run_preflight, STATE_DB, self.app.repo)
+        except Exception as e:
+            _logging.getLogger(__name__).exception("preflight crashed")
+            results = [CheckResult("preflight runner", False,
+                                   f"crashed: {e!r}")]
+        self.app.preflight_results = results
+        from textual.css.query import NoMatches
+        try:
+            self.query_one(PreflightBar).update_from(results)
+        except NoMatches:
+            pass
+
+    async def on_screen_resume(self) -> None:
+        from textual.css.query import NoMatches
+        # Replay buffered log lines
+        try:
+            log_w = self.query_one("#daemon-log", RichLog)
+            log_w.clear()
+            for line in list(self.app.log_buffer):
+                log_w.write(line)
+        except NoMatches:
+            pass
+        # If the daemon died while we were elsewhere, _on_daemon_done could not
+        # reach this Screen (it wasn't on the stack). Re-sync the banner now.
+        last_err = getattr(self.app, "daemon_last_error", None)
+        try:
+            row = self.query_one(CycleSummaryRow)
+            if last_err is not None:
+                row.set_last_error(last_err)
+            else:
+                row.clear_last_error()
+        except NoMatches:
+            pass
+        # Immediate refresh from DB
+        try:
+            await self.app.db_poller.tick_once()
+        except (AttributeError, asyncio.TimeoutError):
+            pass
+
+    def append_log_line(self, msg: str) -> None:
+        from textual.css.query import NoMatches
+        try:
+            self.query_one("#daemon-log", RichLog).write(msg)
+        except NoMatches:
+            pass
+
+    def update_cycle_and_findings(self, payload) -> None:
+        from textual.css.query import NoMatches
+        try:
+            self.query_one(CycleSummaryRow).update_from(payload)
+        except NoMatches:
+            pass
+        try:
+            ftable = self.query_one("#findings", DataTable)
+            ftable.clear()
+            for f in payload.findings:
+                ftable.add_row(f.bug_id, f.severity, f.status, f.title)
+        except NoMatches:
+            pass
+
+    def update_prs(self, rows) -> None:
+        from textual.css.query import NoMatches
+        try:
+            ptable = self.query_one("#prs", DataTable)
+            ptable.clear()
+            for r in rows:
+                ptable.add_row(
+                    f"#{r.github_number}", r.state, r.bug_id, r.title)
+        except NoMatches:
+            pass
+
+    # ── actions ────────────────────────────────────────────────────────
+
+    async def action_start_daemon(self) -> None:
+        from pm_agent import loop as _loop, persistence
+        log = _logging.getLogger("pm_agent.tui")
+        if self.app.daemon_task and not self.app.daemon_task.done():
+            self.app.notify("daemon already running")
+            return
+        if getattr(self.app, "daemon_starting", False):
+            self.app.notify("daemon already starting")
+            return
+        if self.app.preflight_results is None:
+            self.app.notify("preflight not yet run; press p first")
+            return
+
+        hard_fails = [
+            r for r in self.app.preflight_results
+            if not r.ok and not r.warn_only and r.name in HARD_CHECK_NAMES
+        ]
+        if hard_fails:
+            names = ", ".join(r.name for r in hard_fails)
+            self.app.notify(f"preflight failed: {names}", severity="error")
+            return
+
+        for r in self.app.preflight_results:
+            if (not r.ok and not r.warn_only
+                    and r.name not in HARD_CHECK_NAMES):
+                log.info("preflight soft-warn: %s — %s", r.name, r.message)
+
+        self.app.daemon_starting = True
+        try:
+            self.app.daemon_stop_event = asyncio.Event()
+            rec = await asyncio.to_thread(persistence.reconcile, self.app.repo)
+            log.info("reconcile: %s", rec)
+
+            self.app.daemon_last_error = None
+            from textual.css.query import NoMatches
+            try:
+                self.query_one(CycleSummaryRow).clear_last_error()
+            except NoMatches:
+                pass
+
+            self.app.daemon_task = asyncio.create_task(
+                _loop.run_forever(
+                    self.app.repo, self.app.loop_cfg,
+                    install_signal_handlers=False,
+                    skip_init=True, skip_reconcile=True,
+                    stop_event=self.app.daemon_stop_event,
+                ),
+                name="pm-agent-loop",
+            )
+            self.app.daemon_task.add_done_callback(self.app._on_daemon_done)
+        finally:
+            self.app.daemon_starting = False
+
+    async def action_stop_daemon(self) -> None:
+        if getattr(self.app, "daemon_starting", False):
+            self.app.notify("daemon still starting; try again in a moment")
+            return
+        t = self.app.daemon_task
+        if not t or t.done():
+            self.app.notify("no running daemon")
+            return
+        self.app.daemon_stop_event.set()
+        self.app.notify(
+            "stop signal sent; daemon will finish current cycle")
+
+    async def action_preflight(self) -> None:
+        await self._run_preflight_async()
+
+    def action_focus_repo(self) -> None:
+        if getattr(self.app, "is_daemon_active", False):
+            self.app.notify("stop daemon first to change repo")
+            return
+        from textual.css.query import NoMatches
+        try:
+            self.query_one("#repo-input", Input).focus()
+        except NoMatches:
+            pass
+
+    def action_blur_input(self) -> None:
+        from textual.css.query import NoMatches
+        try:
+            self.query_one("#repo-input", Input).blur()
+        except NoMatches:
+            pass
+
+    async def on_input_submitted(self, event):
+        if event.input.id != "repo-input":
+            return
+        new = Path(event.value).expanduser()
+        if not new.is_dir():
+            self.app.notify(f"not a directory: {new}", severity="error")
+            return
+        if not (new / ".git").is_dir():
+            self.app.notify(f"not a git repo: {new}", severity="error")
+            return
+        self.app.repo = new
+        _logging.getLogger("pm_agent.tui").info("repo switched to %s", new)
+        event.input.blur()
+        await self.action_preflight()
+
+
 def _ensure_target_repo(path: Path) -> Path:
     """Create + init path as a git repo if missing. Used as the default scratch
     target so multi-coder demo runs work out of the box."""
@@ -1252,89 +1774,198 @@ def _ensure_target_repo(path: Path) -> Path:
 
 def main() -> None:
     ap = argparse.ArgumentParser(prog="pm-agent.tui")
-    ap.add_argument("goal", nargs="*", help="goal text (omit to enter mock mode)")
-    ap.add_argument(
-        "--repo",
-        type=Path,
-        default=Path("/tmp/pm-agent-day7-target"),
-        help="target git repo for worktrees (default: /tmp/pm-agent-day7-target, aligned with docs/demo-commands.sh)",
-    )
-    ap.add_argument(
-        "--single",
-        action="store_true",
-        help="single-coder mode (day 3-4 behavior); ignores planner decomposition",
-    )
-    ap.add_argument(
-        "--mock-planner",
-        action="store_true",
-        help="skip the real claude-driven planner, use the cheap mock fallback",
-    )
-    ap.add_argument(
-        "--test-cmd",
-        default=None,
-        help="shell command to run inside the integration worktree after a clean merge "
-             "(e.g. 'pytest tests/' or 'python3 -m unittest discover')",
-    )
-    ap.add_argument(
-        "--coder-timeout",
-        type=float,
-        default=180.0,
-        help="seconds before each Coder subprocess is killed (default: 180)",
-    )
-    ap.add_argument(
-        "--max-retries",
-        type=int,
-        default=2,
-        help="planner self-correcting retry budget (default: 2 = up to 3 attempts)",
-    )
-    ap.add_argument(
-        "--test-timeout",
-        type=float,
-        default=120.0,
-        help="seconds before integration test_cmd is killed (default: 120)",
-    )
-    ap.add_argument(
-        "--inject-fault",
-        choices=("planner-yaml", "coder-timeout", "api-error"),
-        default=None,
-        help="Day 11 demo: deterministically trigger an error path. "
-             "planner-yaml: every planner attempt fails parse, falling back "
-             "to mock_planner_decompose. "
-             "coder-timeout: every Coder yields a synthetic timeout event "
-             "(real timeout handler runs). "
-             "api-error: every Coder yields a synthetic rate-limit + "
-             "is_error result. "
-             "All three are free / deterministic — no extra claude tokens.",
-    )
-    ap.add_argument(
-        "--interactive", "-i",
-        action="store_true",
-        help="Day 15: show an input bar at the bottom; type goals and press "
-             "Enter to run them back-to-back. Initial goal arg is optional in "
-             "this mode — omit it to start at the input prompt.",
-    )
+    ap.add_argument("goal", nargs="*", default=None,
+                    help="goal text (omit to enter mock or interactive mode)")
+    ap.add_argument("--repo", default="/tmp/pm-agent-day7-target")
+    ap.add_argument("--daemon", action="store_true",
+                    help="boot directly into daemon mode")
+    ap.add_argument("--single", action="store_true",
+                    help="single-coder mode (day 3-4 behavior)")
+    ap.add_argument("--mock-planner", action="store_true",
+                    help="use mock planner fallback")
+    ap.add_argument("--test-cmd", default=None)
+    ap.add_argument("--coder-timeout", type=float, default=180.0)
+    ap.add_argument("--max-retries", type=int, default=2)
+    ap.add_argument("--test-timeout", type=float, default=120.0)
+    ap.add_argument("--inject-fault",
+                    choices=["planner-yaml", "coder-timeout", "api-error"],
+                    default=None)
+    ap.add_argument("--interactive", action="store_true")
     args = ap.parse_args()
 
-    goal = " ".join(args.goal).strip() or None
+    # Validation: preserve existing CLI safety from prior tui.py main()
+    if args.coder_timeout <= 0:
+        ap.error("--coder-timeout must be > 0")
+    if args.test_timeout <= 0:
+        ap.error("--test-timeout must be > 0")
 
-    # Mock mode: no goal AND not interactive.
-    if goal is None and not args.interactive:
-        PMAgentTUI(goal=None).run()
-        return
+    from pm_agent.loop import LoopConfig
+    loop_cfg = LoopConfig(
+        coder_timeout=args.coder_timeout,
+        test_timeout=args.test_timeout,
+        max_retries=args.max_retries,
+    )
 
-    repo = _ensure_target_repo(args.repo)
-    PMAgentTUI(
-        goal=goal,
+    # Demo / scratch convenience: auto-init the default target repo if it
+    # doesn't exist. Matches pre-Task-13 behavior of the old main().
+    repo = _ensure_target_repo(Path(args.repo).expanduser())
+
+    app = PMAgentTUI(
         repo=repo,
+        goal=" ".join(args.goal) if args.goal else None,
+        open_daemon=args.daemon,
+        loop_cfg=loop_cfg,
+        # remaining kwargs flow to GoalScreen via PMAgentTUI's _goal_kwargs:
         single=args.single,
         use_real_planner=not args.mock_planner,
         test_cmd=args.test_cmd,
         coder_timeout=args.coder_timeout,
-        inject_fault=args.inject_fault,
-        interactive=args.interactive,
         max_retries=args.max_retries,
         test_timeout=args.test_timeout,
-    ).run()
+        inject_fault=args.inject_fault,
+        interactive=args.interactive,
+    )
+    app.run()
+
+
+class PMAgentTUI(App):
+    """Top-level Textual App. Wraps GoalScreen and DaemonScreen and holds
+    daemon-task / log-buffer / db-poller shared state."""
+
+    BINDINGS = [
+        ("g", "switch_screen('goal')",   "Goal mode"),
+        ("d", "switch_screen('daemon')", "Daemon mode"),
+        ("q", "request_quit",            "Quit"),
+    ]
+
+    DEFAULT_CSS = """
+    .panel-title {
+        text-style: bold;
+        background: $boost;
+        height: 1;
+        margin: 0 0 1 0;
+    }
+    """
+
+    def __init__(
+        self,
+        repo=None,
+        goal=None,
+        *,
+        open_daemon: bool = False,
+        loop_cfg=None,
+        **goal_kwargs,
+    ):
+        super().__init__()
+        self.repo = Path(repo) if repo is not None else Path("/tmp/pm-agent-day7-target")
+        self.goal = goal
+        self._open_daemon = open_daemon
+        self._goal_kwargs = goal_kwargs
+        # Initialize DB exactly once
+        from pm_agent import persistence
+        from pm_agent.loop import STATE_DB, LoopConfig
+        persistence.init_db(STATE_DB)
+        self.log_buffer: collections.deque[str] = collections.deque(maxlen=2000)
+        self.daemon_task: asyncio.Task[None] | None = None
+        self.daemon_starting: bool = False
+        self.daemon_stop_event: asyncio.Event | None = None
+        self.daemon_last_error: BaseException | None = None
+        self.preflight_results: list | None = None
+        self.loop_cfg: "LoopConfig" = loop_cfg or LoopConfig()
+        self.log_handler: TUILogHandler | None = None
+        self.db_poller: DbPoller | None = None
+
+    @property
+    def is_daemon_active(self) -> bool:
+        return self.daemon_starting or (
+            self.daemon_task is not None and not self.daemon_task.done()
+        )
+
+    def on_mount(self) -> None:
+        loop = asyncio.get_running_loop()
+        root = _logging.getLogger()
+        # Remove any stale TUILogHandler from prior App instances (pytest)
+        for h in list(root.handlers):
+            if isinstance(h, TUILogHandler):
+                root.removeHandler(h)
+        self.log_handler = TUILogHandler(loop, self.log_buffer, self)
+        self.log_handler.setLevel(_logging.INFO)
+        self.log_handler.setFormatter(_logging.Formatter(
+            "%(asctime)s [%(name)s] %(levelname)s %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        root.addHandler(self.log_handler)
+        _logging.getLogger("textual").setLevel(_logging.WARNING)
+        _logging.getLogger("uvicorn").setLevel(_logging.WARNING)
+        _logging.getLogger("pm_agent").setLevel(_logging.INFO)
+
+        # Install screens (passing constructor args)
+        goal_screen = GoalScreen(
+            repo=self.repo, goal=self.goal, **self._goal_kwargs)
+        self.install_screen(goal_screen, name="goal")
+        self.install_screen(DaemonScreen(), name="daemon")
+
+        self.db_poller = DbPoller(self)
+        self.db_poller.start()
+
+        # Route SIGTERM through Textual exit
+        try:
+            loop.add_signal_handler(signal.SIGTERM, self.exit)
+        except (NotImplementedError, ValueError):
+            pass  # Windows / not main thread
+
+        self.push_screen("daemon" if self._open_daemon else "goal")
+
+    def on_unmount(self) -> None:
+        if self.log_handler is not None:
+            _logging.getLogger().removeHandler(self.log_handler)
+        if self.db_poller is not None:
+            self.db_poller.stop()
+
+    def _on_daemon_done(self, task) -> None:
+        try:
+            task.result()
+            self.daemon_last_error = None
+        except asyncio.CancelledError as e:
+            self.daemon_last_error = e
+        except Exception as e:
+            self.daemon_last_error = e
+        # SystemExit / KeyboardInterrupt are intentionally not caught here —
+        # they propagate to the event loop.
+        self.daemon_task = None
+        _logging.getLogger("pm_agent.tui").info(
+            "daemon stopped: %s", self.daemon_last_error or "clean")
+        # Tell CycleSummaryRow about the error
+        from textual.css.query import NoMatches
+        try:
+            for s in self.screen_stack:
+                if isinstance(s, DaemonScreen):
+                    row = s.query_one(CycleSummaryRow)
+                    if self.daemon_last_error is not None:
+                        row.set_last_error(self.daemon_last_error)
+                    else:
+                        row.clear_last_error()
+        except NoMatches:
+            pass
+
+    async def action_request_quit(self) -> None:
+        if self.daemon_task is not None and not self.daemon_task.done():
+            if self.daemon_stop_event is not None:
+                self.daemon_stop_event.set()
+            self.notify("draining daemon... (30s max)")
+            try:
+                await asyncio.wait_for(self.daemon_task, timeout=30)
+            except asyncio.TimeoutError:
+                self.daemon_task.cancel()
+                self.notify(
+                    "forced exit; worktree cleanup may be incomplete",
+                    severity="warning",
+                )
+                try:
+                    await self.daemon_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self.exit()
 
 
 if __name__ == "__main__":
