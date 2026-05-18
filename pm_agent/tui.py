@@ -42,8 +42,9 @@ from pathlib import Path
 from rich.markup import escape as _rich_escape
 from rich.text import Text
 from textual import work
-from textual.app import App, ComposeResult
+from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.screen import Screen
 from textual.widgets import DataTable, Input, Label, ProgressBar, RichLog, Static
 
 from pm_agent.planner import PlannerError, plan
@@ -418,8 +419,15 @@ def mock_planner_decompose(goal: str) -> list[CoderTask]:
     ]
 
 
-class PMAgentTUI(App):
-    """Day-5 — multi-coder via git worktree + asyncio.gather."""
+class GoalScreen(Screen):
+    """Day-5 — multi-coder via git worktree + asyncio.gather.
+
+    Task 10 (TUI daemon extension): extracted from the prior
+    ``PMAgentTUI(App)`` into a ``Screen`` so that the App-level shell
+    (added in Task 12) can host both this goal-mode UI and the
+    upcoming ``DaemonScreen``. ``PMAgentTUI`` remains as a temporary
+    module-level alias to this class until Task 12 lands the real App.
+    """
 
     CSS = """
     Screen { layout: vertical; }
@@ -483,8 +491,8 @@ class PMAgentTUI(App):
     }
     """
 
+    # Task 10: q/quit lives on the App in Task 12, not on the Screen.
     BINDINGS = [
-        ("q", "quit", "Quit"),
         ("r", "rerun", "Re-run"),
         ("n", "focus_input", "New goal"),
         ("escape", "blur_input", ""),
@@ -1389,10 +1397,37 @@ class PMAgentTUI(App):
         for name, status, action in AGENTS_INITIAL:
             self._set_agent_status(name, status, action)
 
+    def on_screen_resume(self) -> None:
+        """Refresh disable state when switching back to goal mode.
+
+        Task 10: wired against ``self.app.is_daemon_active`` once the real
+        App lands in Task 12. We use ``getattr`` so the interim
+        ``PMAgentTUI = GoalScreen`` alias (which has no daemon state) and
+        plain ``Screen.run_test()`` harnesses don't blow up.
+        """
+        from textual.css.query import NoMatches
+        try:
+            input_w = self.query_one("#goal-input", Input)
+        except NoMatches:
+            return  # not yet mounted / wrong screen
+        is_active = getattr(self.app, "is_daemon_active", False)
+        if is_active:
+            input_w.disabled = True
+            input_w.placeholder = "(locked — daemon running)"
+        else:
+            input_w.disabled = False
+            input_w.placeholder = "type a goal and press Enter"
+
     def action_rerun(self) -> None:
         """Re-run the session. Mock mode resets the ticker; real mode reruns
         the planner + coders + integration. Refuses if a real-mode session is
         still in flight (press q to abort first)."""
+        # Task 10: daemon mode (added in Task 11/12) takes exclusive control
+        # of subprocess scheduling, so disable goal-mode re-runs while it is
+        # active. ``getattr`` keeps this safe before the real App lands.
+        if getattr(self.app, "is_daemon_active", False):
+            self.notify("daemon running; goal mode locked", severity="warning")
+            return
         if self.is_mock:
             self._tick_counter = 0
             self._tasks_done = 0
@@ -1565,11 +1600,11 @@ def main() -> None:
 
     # Mock mode: no goal AND not interactive.
     if goal is None and not args.interactive:
-        PMAgentTUI(goal=None).run()
+        _run_goal_only(goal=None)
         return
 
     repo = _ensure_target_repo(args.repo)
-    PMAgentTUI(
+    _run_goal_only(
         goal=goal,
         repo=repo,
         single=args.single,
@@ -1580,7 +1615,32 @@ def main() -> None:
         interactive=args.interactive,
         max_retries=args.max_retries,
         test_timeout=args.test_timeout,
-    ).run()
+    )
+
+
+def _run_goal_only(**screen_kwargs) -> None:
+    """Interim runner for Task 10-11: wraps ``GoalScreen`` in a bare App.
+
+    ``GoalScreen`` is a ``Screen``, not an ``App``, so it has no ``run()``
+    of its own. Task 12 replaces this with the full ``PMAgentTUI(App)``
+    that hosts both Goal and Daemon screens; until then, ``main()`` calls
+    this helper to keep ``python -m pm_agent.tui`` working.
+    """
+    from textual.app import App as _App
+
+    class _Wrapper(_App):
+        def on_mount(self) -> None:  # pragma: no cover - exercised manually
+            self.push_screen(GoalScreen(**screen_kwargs))
+
+    _Wrapper().run()
+
+
+# TEMPORARY: replaced by the real App in Task 12. Keeps ``pm_agent.tui.main``
+# importable and ``tests/test_cli.py:212`` working until then. Existing
+# reproduction scripts that construct ``PMAgentTUI(goal=None)`` for inspection
+# also keep working because Screen accepts no positional args and stores the
+# legacy kwargs on ``self``.
+PMAgentTUI = GoalScreen
 
 
 if __name__ == "__main__":
