@@ -239,3 +239,51 @@ def test_run_one_cycle_skips_finding_with_open_pr_for_bug():
     assert 0 < gate_pos < coder_pos, (
         "regression: the duplicate-PR gate must run BEFORE Coder-1 spawn"
     )
+
+
+@pytest.mark.asyncio
+async def test_run_forever_skip_init_does_not_touch_state_db(tmp_path, monkeypatch):
+    """skip_init=True must not call persistence.init_db."""
+    from pm_agent import loop, persistence
+    calls = []
+    real_init_db = persistence.init_db
+    monkeypatch.setattr(persistence, "init_db",
+                        lambda p: calls.append(p) or real_init_db(p))
+    real_init_db(tmp_path / "state.db")  # pre-init by the caller
+    calls.clear()
+
+    stop = asyncio.Event()
+    stop.set()  # exit immediately
+    from tests._fixtures.fake_repo import fake_repo
+    with fake_repo({"x.py": ""}) as repo:
+        await loop.run_forever(
+            repo, loop.LoopConfig(),
+            install_signal_handlers=False,
+            skip_init=True, skip_reconcile=True,
+            stop_event=stop,
+        )
+    assert calls == [], "init_db must not be called when skip_init=True"
+
+
+@pytest.mark.asyncio
+async def test_run_forever_install_signal_handlers_false(tmp_path):
+    """install_signal_handlers=False must not call loop.add_signal_handler."""
+    from pm_agent import loop, persistence
+    persistence.init_db(tmp_path / "state.db")
+    stop = asyncio.Event()
+    stop.set()
+    import signal
+    real_loop = asyncio.get_running_loop()
+    before = real_loop._signal_handlers.copy() if hasattr(real_loop, "_signal_handlers") else None
+
+    from tests._fixtures.fake_repo import fake_repo
+    with fake_repo({"x.py": ""}) as repo:
+        await loop.run_forever(
+            repo, loop.LoopConfig(),
+            install_signal_handlers=False,
+            skip_init=True, skip_reconcile=True,
+            stop_event=stop,
+        )
+
+    after = real_loop._signal_handlers.copy() if hasattr(real_loop, "_signal_handlers") else None
+    assert before == after
