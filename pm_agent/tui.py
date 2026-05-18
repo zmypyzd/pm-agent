@@ -32,11 +32,9 @@ import argparse
 import asyncio
 import os
 import subprocess
-import sys
 import time
 import uuid
-from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime as _dt_datetime, timedelta, timezone as _dt_timezone
 from pathlib import Path
 
 from rich.markup import escape as _rich_escape
@@ -213,9 +211,6 @@ class PreflightBar(Static):
             cells.append(f"[{color}]{symbol} {short}[/]")
         self._markup = " │ ".join(cells)
         self.update(self._markup)
-
-
-from datetime import datetime as _dt_datetime, timezone as _dt_timezone
 
 
 class CycleSummaryRow(Static):
@@ -1650,11 +1645,14 @@ class DaemonScreen(Screen):
         from pm_agent import loop as _loop, persistence
         log = _logging.getLogger("pm_agent.tui")
         if self.app.daemon_task and not self.app.daemon_task.done():
-            self.app.notify("daemon already running"); return
+            self.app.notify("daemon already running")
+            return
         if getattr(self.app, "daemon_starting", False):
-            self.app.notify("daemon already starting"); return
+            self.app.notify("daemon already starting")
+            return
         if self.app.preflight_results is None:
-            self.app.notify("preflight not yet run; press p first"); return
+            self.app.notify("preflight not yet run; press p first")
+            return
 
         hard_fails = [
             r for r in self.app.preflight_results
@@ -1702,7 +1700,8 @@ class DaemonScreen(Screen):
             return
         t = self.app.daemon_task
         if not t or t.done():
-            self.app.notify("no running daemon"); return
+            self.app.notify("no running daemon")
+            return
         self.app.daemon_stop_event.set()
         self.app.notify(
             "stop signal sent; daemon will finish current cycle")
@@ -1855,15 +1854,15 @@ class PMAgentTUI(App):
         from pm_agent import persistence
         from pm_agent.loop import STATE_DB, LoopConfig
         persistence.init_db(STATE_DB)
-        self.log_buffer = collections.deque(maxlen=2000)
-        self.daemon_task = None
-        self.daemon_starting = False
-        self.daemon_stop_event = None
-        self.daemon_last_error = None
-        self.preflight_results = None
-        self.loop_cfg = loop_cfg or LoopConfig()
-        self.log_handler = None
-        self.db_poller = None
+        self.log_buffer: collections.deque[str] = collections.deque(maxlen=2000)
+        self.daemon_task: asyncio.Task[None] | None = None
+        self.daemon_starting: bool = False
+        self.daemon_stop_event: asyncio.Event | None = None
+        self.daemon_last_error: BaseException | None = None
+        self.preflight_results: list | None = None
+        self.loop_cfg: "LoopConfig" = loop_cfg or LoopConfig()
+        self.log_handler: TUILogHandler | None = None
+        self.db_poller: DbPoller | None = None
 
     @property
     def is_daemon_active(self) -> bool:
