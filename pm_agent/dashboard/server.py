@@ -1,38 +1,21 @@
-"""FastAPI dashboard. Polls state.db read-only via HTMX 1s (live) / 30s (trend).
-
-Per spec §3 dashboard endpoints + §7 demo Beat 2 (Live Cycle) / Beat 7 (cost).
-
-The Live Cycle panel sits at the top. Cumulative cost banner shows
-prominently with a red color when > $50 — the user's "I should check on
-this" signal during a long unattended run.
-"""
+"""FastAPI + HTMX dashboard for pm-agent (Beta loop). Thin wrappers over
+pm_agent.persistence_queries — see that module for SQL bodies."""
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
-from starlette.requests import Request
 
-from pm_agent import persistence
+from pm_agent import persistence, persistence_queries as queries
 
 HERE = Path(__file__).parent
 templates = Jinja2Templates(directory=str(HERE / "templates"))
-
-
-class CycleSummary(BaseModel):
-    id: int
-    status: str
-    started_at: str
-    finished_at: str | None
-    cost_usd: float
-    findings_total: int
 
 
 class FindingSummary(BaseModel):
@@ -42,10 +25,29 @@ class FindingSummary(BaseModel):
     status: str
 
 
+class CycleSummary(BaseModel):
+    id: int
+    status: str
+    started_at: str
+    finished_at: Optional[str] = None
+    cost_usd: float
+    findings_total: int
+    findings_pr_opened: int = 0
+
+
+class FinishedCycleSummary(BaseModel):
+    id: int
+    status: str
+    started_at: str
+    finished_at: Optional[str] = None
+    cost_usd: float
+
+
 class LiveCycleResponse(BaseModel):
-    cycle: CycleSummary | None
-    status: Literal["idle", "running", "aborted"]
+    cycle: Optional[CycleSummary] = None
+    status: str
     findings: list[FindingSummary] = []
+    last_finished: Optional[FinishedCycleSummary] = None
 
 
 class TrendPoint(BaseModel):
@@ -57,7 +59,23 @@ class TrendPoint(BaseModel):
 
 
 class TrendResponse(BaseModel):
-    points: list[TrendPoint]
+    points: list[TrendPoint] = []
+
+
+def _to_cycle(c) -> CycleSummary:
+    return CycleSummary(
+        id=c.id, status=c.status, started_at=c.started_at,
+        finished_at=c.finished_at, cost_usd=c.cost_usd,
+        findings_total=c.findings_total,
+        findings_pr_opened=c.findings_pr_opened,
+    )
+
+
+def _to_finished(lf) -> FinishedCycleSummary:
+    return FinishedCycleSummary(
+        id=lf.id, status=lf.status, started_at=lf.started_at,
+        finished_at=lf.finished_at, cost_usd=lf.cost_usd,
+    )
 
 
 def create_app() -> FastAPI:
@@ -69,114 +87,38 @@ def create_app() -> FastAPI:
         return templates.TemplateResponse(request, "index.html")
 
     @app.get("/api/live", response_model=LiveCycleResponse)
-    def live_cycle() -> LiveCycleResponse:
-        """HTMX 1s polling. Returns 200 + status='idle' when no running
-        cycle — never 404 — so the client polling loop has stable state."""
+    def live_cycle_route() -> LiveCycleResponse:
         try:
-            c = persistence.get_conn()
+            payload = queries.live_cycle()
         except (RuntimeError, sqlite3.OperationalError, sqlite3.DatabaseError):
             return LiveCycleResponse(cycle=None, status="idle", findings=[])
-        try:
-            row = c.execute(
-                """SELECT id, status, started_at, finished_at, cost_usd
-                   FROM cycles WHERE status='running'
-                   ORDER BY started_at DESC LIMIT 1""",
-            ).fetchone()
-            if row is None:
-                return LiveCycleResponse(cycle=None, status="idle", findings=[])
-            n_findings = c.execute(
-                "SELECT COUNT(*) AS n FROM findings WHERE cycle_id=?", (row["id"],),
-            ).fetchone()["n"]
-            # R3-C-01: cycles.cost_usd is only written by finish_cycle(), so it's
-            # 0 during a running cycle. Sum live from the costs table instead so
-            # the Live Cycle panel reflects actual spend during long unattended runs.
-            live_cost = c.execute(
-                "SELECT COALESCE(SUM(usd), 0) AS total FROM costs WHERE cycle_id=?",
-                (row["id"],),
-            ).fetchone()["total"]
-            # LIMIT 50: spec scenario is ~5 findings/cycle; 50 is a safe ceiling
-            # that bounds JSON payload size even for unexpectedly large cycles.
-            # R3-C-03: ORDER BY id DESC so operators see freshest findings first
-            # (previously ASC → with >50 findings the newest were invisible).
-            findings_rows = c.execute(
-                """SELECT bug_id, title, severity, status FROM findings
-                   WHERE cycle_id=? ORDER BY id DESC LIMIT 50""",
-                (row["id"],),
-            ).fetchall()
-            findings_list = [
-                FindingSummary(
-                    bug_id=r["bug_id"], title=r["title"],
-                    severity=r["severity"], status=r["status"],
-                )
-                for r in findings_rows
-            ]
-            return LiveCycleResponse(
-                cycle=CycleSummary(
-                    id=row["id"], status=row["status"], started_at=row["started_at"],
-                    finished_at=row["finished_at"], cost_usd=float(live_cost),
-                    findings_total=n_findings,
-                ),
-                status="running",
-                findings=findings_list,
-            )
-        except (sqlite3.OperationalError, sqlite3.DatabaseError):
-            # DB became unreadable mid-query (rare; WAL hiccup, file deleted)
-            return LiveCycleResponse(cycle=None, status="idle", findings=[])
+        return LiveCycleResponse(
+            cycle=_to_cycle(payload.cycle) if payload.cycle else None,
+            status=payload.status,
+            findings=[
+                FindingSummary(bug_id=f.bug_id, title=f.title,
+                               severity=f.severity, status=f.status)
+                for f in payload.findings
+            ],
+            last_finished=_to_finished(payload.last_finished)
+                if payload.last_finished else None,
+        )
 
     @app.get("/api/trend", response_model=TrendResponse)
-    def trend_24h() -> TrendResponse:
-        """HTMX 30s polling. Returns cumulative-cost time series + per-cycle
-        findings/PRs/merges counts for the last 24 hours."""
+    def trend_route() -> TrendResponse:
         try:
-            c = persistence.get_conn()
+            payload = queries.trend_24h()
         except (RuntimeError, sqlite3.OperationalError, sqlite3.DatabaseError):
             return TrendResponse(points=[])
-        try:
-            cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-            cycles = c.execute(
-                """SELECT id, started_at, cost_usd FROM cycles
-                   WHERE started_at >= ? ORDER BY started_at""",
-                (cutoff,),
-            ).fetchall()
-            cumulative = 0.0
-            points: list[TrendPoint] = []
-            for row in cycles:
-                # R3-C-02: cycles.cost_usd is 0 until finish_cycle() runs, so
-                # the cumulative banner under-reported during a live cycle. Sum
-                # from the costs table per cycle so the red-warning threshold
-                # ($50) trips on real-time spend, not stale completed-cycle data.
-                cost_row = c.execute(
-                    "SELECT COALESCE(SUM(usd), 0) AS total FROM costs WHERE cycle_id=?",
-                    (row["id"],),
-                ).fetchone()
-                cumulative += float(cost_row["total"] or 0)
-                findings_n = c.execute(
-                    "SELECT COUNT(*) AS n FROM findings WHERE cycle_id=?", (row["id"],),
-                ).fetchone()["n"]
-                prs_n = c.execute(
-                    """SELECT COUNT(*) AS n FROM prs p
-                       JOIN findings f ON p.finding_id=f.id WHERE f.cycle_id=?""",
-                    (row["id"],),
-                ).fetchone()["n"]
-                merges_n = c.execute(
-                    """SELECT COUNT(*) AS n FROM prs p
-                       JOIN findings f ON p.finding_id=f.id
-                       WHERE f.cycle_id=? AND p.state='merged'""",
-                    (row["id"],),
-                ).fetchone()["n"]
-                points.append(TrendPoint(
-                    ts=row["started_at"],
-                    findings_total=findings_n,
-                    prs_opened=prs_n,
-                    merges=merges_n,
-                    cumulative_cost_usd=round(cumulative, 4),
-                ))
-            return TrendResponse(points=points)
-        except (sqlite3.OperationalError, sqlite3.DatabaseError):
-            return TrendResponse(points=[])
+        return TrendResponse(points=[
+            TrendPoint(
+                ts=p.ts, findings_total=p.findings_total,
+                prs_opened=p.prs_opened, merges=p.merges,
+                cumulative_cost_usd=p.cumulative_cost_usd,
+            ) for p in payload.points
+        ])
 
     return app
 
 
-# uvicorn entry: pm_agent.dashboard.server:app
 app = create_app()

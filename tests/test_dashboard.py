@@ -91,3 +91,34 @@ def test_api_trend_cumulative_cost_accumulates(tmp_path):
     costs = [p["cumulative_cost_usd"] for p in points]
     assert costs == sorted(costs)  # monotonically non-decreasing
     assert abs(costs[-1] - 0.60) < 1e-6  # final cumulative
+
+
+def test_api_live_running_includes_findings_pr_opened(tmp_path):
+    """LiveCycleResponse must include the new `findings_pr_opened` field."""
+    init_db(tmp_path / "state.db")
+    cid = start_cycle()
+    f = Finding(
+        bug_id="aa1", title="t", severity="Low",
+        paths=["a.py"], acceptance=["ok"], evidence="e", kind="bug",
+    )
+    fid = record_finding(cid, f)
+    from pm_agent.persistence import update_finding
+    update_finding(fid, "done")
+    client = TestClient(create_app())
+    r = client.get("/api/live")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "running"
+    assert data["cycle"]["findings_pr_opened"] == 1
+    assert data["cycle"]["findings_total"] == 1
+
+
+def test_api_live_includes_last_finished_when_idle(tmp_path):
+    init_db(tmp_path / "state.db")
+    cid = start_cycle()
+    finish_cycle(cid, "done", 0.0)
+    client = TestClient(create_app())
+    r = client.get("/api/live")
+    data = r.json()
+    assert data["status"] == "idle"
+    assert data["last_finished"]["id"] == cid
