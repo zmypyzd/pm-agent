@@ -220,6 +220,84 @@ class PreflightBar(Static):
         self.update(self._markup)
 
 
+from datetime import datetime as _dt_datetime, timezone as _dt_timezone
+
+
+class CycleSummaryRow(Static):
+    """One-row cycle summary above the Findings/PR tables."""
+
+    DEFAULT_CSS = """
+    CycleSummaryRow {
+        height: 1;
+        background: $boost;
+        padding: 0 1;
+    }
+    """
+
+    _last_error: object | None = None
+    _markup: str = ""
+
+    @property
+    def renderable(self):
+        """Test-friendly access to the raw Rich markup string.
+
+        Textual 8.2.5's Static does not expose .renderable on unmounted
+        widgets; the property here lets unit tests assert on the markup
+        without mounting the widget into an App.
+        """
+        return self._markup
+
+    def set_last_error(self, err) -> None:
+        self._last_error = err
+
+    def clear_last_error(self) -> None:
+        self._last_error = None
+
+    def update_from(self, payload) -> None:
+        from rich.markup import escape as _rich_escape
+        if self._last_error is not None:
+            reason = _rich_escape(str(self._last_error))[:80]
+            self._markup = (
+                f"[red]daemon crashed:[/] {reason}  "
+                f"[grey50]press 's' to restart[/]"
+            )
+        elif payload.status == "idle":
+            lf = payload.last_finished
+            if lf is None:
+                self._markup = (
+                    "[grey50]daemon idle — press 's' to start "
+                    "(no prior cycle)[/]"
+                )
+            else:
+                when = lf.finished_at or lf.started_at
+                short = when.split("T")[1][:5] if "T" in when else when
+                self._markup = (
+                    f"[grey50]idle[/]  last cycle [bold]#{lf.id}[/] "
+                    f"{lf.status}  ${lf.cost_usd:.4f}  at {short}"
+                )
+        else:
+            c = payload.cycle
+            elapsed = self._fmt_elapsed(c.started_at)
+            self._markup = (
+                f"cycle [bold]#{c.id}[/]  [yellow]{c.status}[/]  "
+                f"PR opened [green]{c.findings_pr_opened}[/]/"
+                f"{c.findings_total}  "
+                f"${c.cost_usd:.4f}  elapsed {elapsed}"
+            )
+        self.update(self._markup)
+
+    @staticmethod
+    def _fmt_elapsed(started_at: str) -> str:
+        try:
+            t0 = _dt_datetime.fromisoformat(started_at)
+            if t0.tzinfo is None:
+                t0 = t0.replace(tzinfo=_dt_timezone.utc)
+            secs = int((_dt_datetime.now(_dt_timezone.utc) - t0).total_seconds())
+            return f"{secs}s" if secs < 60 else f"{secs // 60}m{secs % 60}s"
+        except ValueError:
+            return started_at
+
+
 GOAL_MOCK = "Add room invite link API to werewolf platform (mock)"
 
 # Day 10 polish: status icons + colors used by agent cards and task table.
