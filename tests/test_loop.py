@@ -266,15 +266,16 @@ async def test_run_forever_skip_init_does_not_touch_state_db(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_run_forever_install_signal_handlers_false(tmp_path):
+async def test_run_forever_install_signal_handlers_false(tmp_path, monkeypatch):
     """install_signal_handlers=False must not call loop.add_signal_handler."""
     from pm_agent import loop, persistence
     persistence.init_db(tmp_path / "state.db")
     stop = asyncio.Event()
     stop.set()
-    import signal
     real_loop = asyncio.get_running_loop()
-    before = real_loop._signal_handlers.copy() if hasattr(real_loop, "_signal_handlers") else None
+
+    spy_calls: list = []
+    monkeypatch.setattr(real_loop, "add_signal_handler", lambda *a, **kw: spy_calls.append((a, kw)))
 
     from tests._fixtures.fake_repo import fake_repo
     with fake_repo({"x.py": ""}) as repo:
@@ -285,5 +286,29 @@ async def test_run_forever_install_signal_handlers_false(tmp_path):
             stop_event=stop,
         )
 
-    after = real_loop._signal_handlers.copy() if hasattr(real_loop, "_signal_handlers") else None
-    assert before == after
+    assert spy_calls == [], "add_signal_handler must not be called when install_signal_handlers=False"
+
+
+@pytest.mark.asyncio
+async def test_run_forever_creates_own_stop_event_when_none(tmp_path):
+    """stop_event=None must work: function creates its own event internally."""
+    from pm_agent import loop as _loop, persistence
+    from tests._fixtures.fake_repo import fake_repo
+    persistence.init_db(tmp_path / "state.db")
+    cfg = _loop.LoopConfig(interval_s=3600)  # large so the inner wait blocks
+    with fake_repo({"x.py": ""}) as repo:
+        task = asyncio.create_task(
+            _loop.run_forever(
+                repo, cfg,
+                install_signal_handlers=False,
+                skip_init=True, skip_reconcile=True,
+                stop_event=None,  # explicit None — function must construct one
+            )
+        )
+        await asyncio.sleep(0.05)  # let it enter the loop once
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert task.done()
