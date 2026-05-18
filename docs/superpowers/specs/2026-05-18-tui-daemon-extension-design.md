@@ -47,6 +47,18 @@ giving up the existing goal-driven workflow.
 | Goal/daemon concurrency | Mutually exclusive — daemon running locks goal inputs |
 | Code structure | Textual `Screen` split inside `tui.py` |
 
+**Textual API surface used (verified against `textual>=8.2.5`):**
+
+- `App.install_screen(screen, name)` — accepts Screen instance positional.
+- `App.switch_screen(name_or_screen)` — non-awaiting OK.
+- `App.push_screen(name_or_screen)` — non-awaiting OK.
+- `Screen.is_current` — property, true when this screen is at the top of the
+  app's screen stack or in background.
+- `on_screen_resume(self, event)` / `on_screen_suspend(self, event)` —
+  message-handler convention; delivered when `ScreenResume`/`ScreenSuspend`
+  events fire on the Screen.
+- `RichLog(..., max_lines=N)` — supported.
+
 ## §1 Architecture
 
 ```
@@ -59,6 +71,7 @@ PMAgentTUI (App)
 │   ├─ daemon_stop_event: asyncio.Event | None   (lazy, see I-3)
 │   ├─ daemon_last_error: BaseException | None
 │   ├─ preflight_results: list[CheckResult] | None
+│   ├─ loop_cfg: LoopConfig                      (built from CLI flags; see §2.8)
 │   ├─ log_handler: TUILogHandler
 │   ├─ log_buffer: collections.deque[str] maxlen=2000
 │   └─ db_poller: DbPoller
@@ -75,6 +88,8 @@ PMAgentTUI (App)
 ### Invariants
 
 **I-1 · DB lifecycle.**
+`STATE_DB` is the module constant currently defined at `pm_agent/loop.py:27`
+(`Path.home() / ".pm-agent" / "state.db"`). The TUI imports it: `from pm_agent.loop import STATE_DB`.
 TUI calls `persistence.init_db(STATE_DB)` exactly once in `PMAgentTUI.__init__`.
 `loop.run_forever` is invoked with `skip_init=True, skip_reconcile=True`; the
 daemon Screen does its own `persistence.reconcile(repo)` explicitly inside
@@ -122,6 +137,18 @@ STATE_DB, app.repo)` so the UI does not freeze during the 15-second
 `gh auth` check. Re-runs on `p` use the same wrapper.
 
 **I-5 · Mutual exclusion.**
+`is_daemon_active` is a single App property — **must include the starting
+window** so GoalScreen does not race-unlock between `daemon_starting=True`
+and `daemon_task` assignment:
+
+```python
+@property
+def is_daemon_active(self) -> bool:
+    return self.daemon_starting or (
+        self.daemon_task is not None and not self.daemon_task.done()
+    )
+```
+
 When `is_daemon_active`:
 - `GoalScreen` `#goal-input` is disabled with placeholder
   `"(locked — daemon running)"`.
@@ -129,12 +156,37 @@ When `is_daemon_active`:
 - `DaemonScreen` `R` (set repo) is a no-op with `"stop daemon first to
   change repo"`.
 
+All consumers read `app.is_daemon_active`, not the raw fields.
+
 **I-6 · BINDINGS focus.**
 Textual `Input` widgets swallow keys when focused. `escape` is bound on both
 Screens to blur the focused Input. Operators press `esc` then `q`/`g`/`d`/
 `s`/`x`/`p`/`R`.
 
 ## §2 Components
+
+**Imports used throughout the snippets in §2** (declared once here, not
+repeated in each block):
+
+```python
+import asyncio
+import collections
+import logging
+import signal
+import sqlite3
+
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.screen import Screen
+from textual.widgets import DataTable, Input, RichLog, Static
+
+from pm_agent import loop, persistence, persistence_queries as queries, preflight
+from pm_agent.loop import LoopConfig, STATE_DB
+from pm_agent.preflight import CheckResult
+
+log = logging.getLogger(__name__)
+```
 
 ### 2.1 PMAgentTUI
 
@@ -202,8 +254,12 @@ class PMAgentTUI(App):
         try:
             task.result()
             self.daemon_last_error = None
-        except BaseException as e:
+        except asyncio.CancelledError as e:
             self.daemon_last_error = e
+        except Exception as e:
+            self.daemon_last_error = e
+        # Note: do NOT catch SystemExit / KeyboardInterrupt here — those should
+        # propagate naturally to the Textual event loop and trigger app exit.
         self.daemon_task = None
         log.info("daemon stopped: %s", self.daemon_last_error or "clean")
 ```
@@ -291,28 +347,80 @@ class DbPoller:
                 log.exception("db poller live tick crashed")
             await asyncio.sleep(self.LIVE_INTERVAL)
 
-    async def _loop_prs(self): ...  # mirror of _loop_live
+    async def _loop_prs(self):
+        while True:
+            try:
+                data = await asyncio.wait_for(
+                    asyncio.to_thread(queries.recent_prs_24h),
+                    timeout=self.PRS_TIMEOUT)
+                screen = self._current_daemon_screen()
+                if screen:
+                    screen.update_prs(data)
+            except asyncio.CancelledError:
+                raise
+            except sqlite3.OperationalError as e:
+                log.warning("db poll (prs) failed: %s", e)
+            except asyncio.TimeoutError:
+                log.warning("db poll (prs) timeout")
+            except Exception:
+                log.exception("db poller prs tick crashed")
+            await asyncio.sleep(self.PRS_INTERVAL)
+
+    def _current_daemon_screen(self):
+        if not self._app.screen_stack:
+            return None
+        top = self._app.screen_stack[-1]
+        return top if isinstance(top, DaemonScreen) else None
 ```
 
 ### 2.4 pm_agent/persistence_queries.py (new)
 
-Three pure functions, shared by dashboard and TUI:
+Three pure functions, shared by dashboard and TUI.
 
-- `live_cycle() -> LiveCyclePayload` — current running cycle + findings + counts + cost + `last_finished` summary.
-- `trend_24h() -> TrendPayload` — 24h cumulative cost + per-cycle counts.
-- `recent_prs_24h() -> list[PRRow]` — last 24h PRs, DESC by `created_at`, joined to findings for `bug_id`.
+`live_cycle()` returns `LiveCyclePayload` — current running cycle + findings
++ counts + cost + `last_finished` summary. Counts use a single query with
+`SUM(CASE WHEN status='done' THEN 1 ELSE 0 END)` — SQLite supports this
+since 3.x (the project requires SQLite 3.24+ for WAL anyway). Index
+`idx_findings_cycle_status` covers it.
 
-`live_cycle` returns both `findings_total` and `findings_pr_opened` (the `status='done'` count) in a single query using `SUM(CASE WHEN status='done' THEN 1 ELSE 0 END)`. The existing `idx_findings_cycle_status` index covers it.
+`trend_24h()` returns cumulative cost + per-cycle counts, same shape as
+dashboard's current `/api/trend` body.
+
+`recent_prs_24h()` returns last 24h PRs:
+
+```sql
+SELECT p.github_number, p.state, p.action, p.url, p.created_at,
+       f.bug_id, f.title, f.severity
+FROM prs p
+JOIN findings f ON p.finding_id = f.id
+WHERE p.created_at >= ?
+ORDER BY p.id DESC
+LIMIT 50
+```
+
+`?` is bound to `(datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()`.
+`prs.created_at` is stored by `persistence._now()` (UTC ISO 8601), and ISO
+8601 strings sort lexicographically — so a string `>=` comparison is correct
+for the cutoff.
 
 dashboard `server.py` becomes a thin wrapper that calls these functions.
 
 ### 2.5 DaemonScreen
 
 ```python
+# Names must match preflight.py CheckResult.name strings verbatim.
+# Verified against preflight.py:40,72,119,160,195,241,276 on 2026-05-18.
 HARD_CHECK_NAMES = {
-    "state.db dir writable", "claude CLI", "gh auth",
-    "repo clean", "tmp writable",
-}  # excludes "state.db clean" (warn-only) and "repo on main" (warn_only=True)
+    "state.db dir writable",   # preflight.py:40
+    "claude CLI on PATH",      # preflight.py:119
+    "gh CLI authenticated",    # preflight.py:160
+    "repo clean",              # preflight.py:195
+    "/tmp writable",           # preflight.py:276
+}
+# Deliberately excluded:
+#   "state.db clean"  — hard-fails on any prior cycle (would refuse run-2+);
+#                       we demote to soft-warn here so re-launches work.
+#   "repo on main"    — already warn_only=True in preflight.py:262, never a gate.
 
 class DaemonScreen(Screen):
     BINDINGS = [
@@ -380,9 +488,12 @@ class DaemonScreen(Screen):
             log.info("reconcile: %s", rec)
 
             self.app.daemon_last_error = None
+            # B3: pass through CLI-supplied LoopConfig fields. main() builds this
+            # from --coder-timeout / --test-cmd / --test-timeout / --max-retries
+            # and stores it on the App as self.app.loop_cfg.
             self.app.daemon_task = asyncio.create_task(
                 loop.run_forever(
-                    self.app.repo, LoopConfig(),
+                    self.app.repo, self.app.loop_cfg,
                     install_signal_handlers=False,
                     skip_init=True, skip_reconcile=True,
                     stop_event=self.app.daemon_stop_event,
@@ -413,7 +524,7 @@ class DaemonScreen(Screen):
         self.query_one(PreflightBar).update(results)
 
     def action_focus_repo(self):
-        if self.app.daemon_task and not self.app.daemon_task.done():
+        if self.app.is_daemon_active:
             self.notify("stop daemon first to change repo"); return
         self.query_one("#repo-input", Input).focus()
 ```
@@ -434,13 +545,40 @@ to PR opened, not PR merged.
 
 Existing PMAgentTUI body refactored into a Screen class. `on_screen_resume`
 refreshes the disable state of `#goal-input` and `r` action based on
-`app.daemon_task`. Otherwise unchanged.
+`app.is_daemon_active` (see I-5). Otherwise unchanged.
+
+**`ARTIFACTS_ROOT` constraint.** The module-level constant `pm_agent.tui.
+ARTIFACTS_ROOT` (currently `tui.py:151`) MUST remain a module-level constant
+in `tui.py` after the refactor. `tests/conftest.py:24-30` monkey-patches it
+to redirect artifact writes into the test's tmp dir; moving it into a class
+would silently break the test fixture.
 
 ### 2.8 main() argv
 
-Unchanged shape — adds `--daemon` (boolean) to the existing argparse setup.
-`cli.py`'s argv-hack invocation continues to work; `tests/test_cli.py:212`
-unchanged.
+Adds `--daemon` (boolean) to the existing argparse setup. `cli.py`'s
+argv-hack invocation continues to work; `tests/test_cli.py:212` unchanged.
+
+**Existing flags route to daemon mode.** `main()` builds a `LoopConfig` from
+the same flags the goal mode already accepts, and assigns it to `app.loop_cfg`
+so `action_start_daemon` can pass it into `loop.run_forever`:
+
+```python
+loop_cfg = LoopConfig(
+    coder_timeout=args.coder_timeout,
+    test_timeout=args.test_timeout,
+    max_retries=args.max_retries,
+    # interval_s and blocklist keep LoopConfig defaults; CLI flag for
+    # interval_s is a follow-up (see Out of scope).
+)
+app = PMAgentTUI(repo=..., goal=..., open_daemon=args.daemon, loop_cfg=loop_cfg,
+                 # remaining kwargs go to GoalScreen as before
+                 single=args.single, test_cmd=args.test_cmd, ...)
+```
+
+`args.test_cmd` is consumed by GoalScreen (as today). LoopConfig itself does
+not have a `test_cmd` field — `loop.run_gates` always uses `pytest`. If the
+user supplies `--test-cmd` in daemon mode it is silently ignored (documented
+limitation; daemon's gate command is fixed by spec).
 
 ### 2.9 loop.run_forever signature
 
@@ -619,7 +757,7 @@ Minimum 12 automated, rest manual (see acceptance criteria below).
 | E7 | Daemon starts → 5 s GhAuthError → self-stops | `daemon_last_error` set; task cleared; CycleSummaryRow red "daemon crashed" |
 | E8 | Rapid `d`/`g` switching | Log replay holds; cycle table keeps refreshing |
 | E9 | Quit while cycle is mid-finding | 30 s drain; cancel; "forced exit" notice |
-| E10 | Quit while reconcile is running | Reconcile completes synchronously before exit |
+| E10 | Quit while reconcile is running | `action_request_quit` awaits `daemon_starting` to clear (max 30 s) before exit; reconcile is a `to_thread` call and completes before `daemon_starting=False` runs |
 | E11 | DB file deleted externally | DbPoller swallows OperationalError; UI freezes its values; log warning |
 | E12 | Preflight runner itself crashes | Synthetic "preflight runner ✗" cell; gate refuses |
 | E13 | `--daemon` boot with all-failing preflight | Daemon screen shows red preflight; `g` returns to working goal mode |
@@ -694,10 +832,17 @@ Minimum 12 automated, rest manual (see acceptance criteria below).
 - Migrate `runner.py` / `preflight.py` / `report.py` `print()` calls to
   `logging` so claude session-id / cost / exit reaches the TUI log.
 - pytest-textual-snapshot tests (visual regression).
-- dashboard rendering `last_finished_cycle` in its idle state.
+- dashboard rendering `last_finished_cycle` and `findings_pr_opened` in its
+  UI (data already available via API).
 - Long-running soak benchmarks as a CI job.
 - Removing the argv-hack from `cli.cmd_tui` and migrating to a kwarg
   invocation — bundled with a `tests/test_cli.py:212` rewrite.
+- `--interval-s` CLI flag and `--blocklist` CLI flag (daemon currently uses
+  `LoopConfig` defaults: 1800s interval, fixed blocklist tuple).
+- Configurable graceful-drain timeout (currently hardcoded 30 s in
+  `action_request_quit`).
+- First-time-operator UX: a one-line hint banner explaining `s`/`x`/`p`/`R`
+  bindings when DaemonScreen first mounts.
 
 ## Files touched
 
@@ -706,7 +851,7 @@ Minimum 12 automated, rest manual (see acceptance criteria below).
 | `pm_agent/tui.py` | Refactor `PMAgentTUI` into App+two Screens; add `TUILogHandler`, `DbPoller`, `PreflightBar`, `CycleSummaryRow`. |
 | `pm_agent/loop.py` | Add `install_signal_handlers / skip_init / skip_reconcile / stop_event` kwargs; switch to `asyncio.get_running_loop()`. |
 | `pm_agent/persistence_queries.py` | New: shared SQL for dashboard + TUI. |
-| `pm_agent/dashboard/server.py` | Thin wrappers around new `queries` module; add `findings_pr_opened` to `LiveCycleResponse`. |
+| `pm_agent/dashboard/server.py` | Thin wrappers around new `queries` module; add `findings_pr_opened` to `LiveCycleResponse` (additive field; HTMX template ignores unknown fields, no template update required in this PR). |
 | `pm_agent/cli.py` | Unchanged (argv-hack preserved). |
 | `tests/conftest.py` | Unchanged. |
 | `tests/test_cli.py` | Unchanged. |
