@@ -1796,8 +1796,12 @@ def main() -> None:
         max_retries=args.max_retries,
     )
 
+    # Demo / scratch convenience: auto-init the default target repo if it
+    # doesn't exist. Matches pre-Task-13 behavior of the old main().
+    repo = _ensure_target_repo(Path(args.repo).expanduser())
+
     app = PMAgentTUI(
-        repo=Path(args.repo).expanduser(),
+        repo=repo,
         goal=" ".join(args.goal) if args.goal else None,
         open_daemon=args.daemon,
         loop_cfg=loop_cfg,
