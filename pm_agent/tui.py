@@ -51,6 +51,49 @@ from pm_agent.runner import run_claude_async
 from pm_agent.tasks import CoderTask
 from pm_agent.worktree import IntegrationResult, WorktreeManager
 
+import collections
+import logging as _logging  # avoid clashing with the existing `log` variable used in this module
+import sqlite3
+
+
+# Forward declaration — DaemonScreen is defined fully in Task 11.
+# TUILogHandler uses isinstance(..., DaemonScreen); the symbol must exist
+# at module load time. The stub is replaced in Task 11.
+class DaemonScreen:  # noqa: D401 — stub, replaced in Task 11
+    """Stub. Replaced by the full Screen class in Task 11."""
+    pass
+
+
+class TUILogHandler(_logging.Handler):
+    """Bridge stdlib logging → Textual RichLog, thread-safe.
+
+    emit() may be called from any thread (e.g. asyncio.to_thread workers).
+    It schedules _dispatch on the main event loop via call_soon_threadsafe,
+    where it is safe to touch the buffer and Screen widgets.
+    """
+
+    def __init__(self, loop, buffer, app):
+        super().__init__()
+        self._loop = loop
+        self._buffer = buffer
+        self._app = app
+
+    def emit(self, record: _logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+        except Exception:
+            self.handleError(record)
+            return
+        self._loop.call_soon_threadsafe(self._dispatch, msg)
+
+    def _dispatch(self, msg: str) -> None:
+        """Runs on the main event loop thread."""
+        self._buffer.append(msg)
+        screen = self._app.screen_stack[-1] if self._app.screen_stack else None
+        if isinstance(screen, DaemonScreen):
+            screen.append_log_line(msg)
+
+
 GOAL_MOCK = "Add room invite link API to werewolf platform (mock)"
 
 # Day 10 polish: status icons + colors used by agent cards and task table.
