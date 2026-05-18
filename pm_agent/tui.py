@@ -254,7 +254,6 @@ class CycleSummaryRow(Static):
         self._last_error = None
 
     def update_from(self, payload) -> None:
-        from rich.markup import escape as _rich_escape
         if self._last_error is not None:
             reason = _rich_escape(str(self._last_error))[:80]
             self._markup = (
