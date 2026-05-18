@@ -57,13 +57,6 @@ import logging as _logging  # avoid clashing with the existing `log` variable us
 import sqlite3
 
 
-# Forward declaration — DaemonScreen is defined fully in Task 11.
-# TUILogHandler uses isinstance(..., DaemonScreen); the symbol must exist
-# at module load time. The stub is replaced in Task 11.
-class DaemonScreen:  # noqa: D401 — stub, replaced in Task 11
-    """Stub. Replaced by the full Screen class in Task 11."""
-    pass
-
 
 class TUILogHandler(_logging.Handler):
     """Bridge stdlib logging → Textual RichLog, thread-safe.
@@ -1510,6 +1503,243 @@ class GoalScreen(Screen):
         if not self.interactive:
             return
         self.set_focus(None)
+
+
+# Names must match preflight.py CheckResult.name strings verbatim.
+# Verified 2026-05-18 against preflight.py:40,72,119,160,195,241,276.
+HARD_CHECK_NAMES = {
+    "state.db dir writable",
+    "claude CLI on PATH",
+    "gh CLI authenticated",
+    "repo clean",
+    "/tmp writable",
+}
+# Excluded deliberately:
+#   "state.db clean" — hard-fails on any prior cycle; we demote to soft-warn.
+#   "repo on main"   — already warn_only=True in preflight.
+
+
+class DaemonScreen(Screen):
+    BINDINGS = [
+        ("s",      "start_daemon",  "Start"),
+        ("x",      "stop_daemon",   "Stop"),
+        ("p",      "preflight",     "Re-preflight"),
+        ("R",      "focus_repo",    "Set repo"),
+        ("escape", "blur_input",    ""),
+    ]
+
+    DEFAULT_CSS = """
+    DaemonScreen { layout: vertical; }
+    #cycle-row { height: 1; }
+    #main { height: 1fr; }
+    #left {
+        width: 50%;
+        height: 100%;
+        border: solid $secondary;
+    }
+    #daemon-log {
+        width: 1fr;
+        height: 100%;
+        border: solid $secondary;
+    }
+    #repo-input {
+        height: 3;
+        background: $surface;
+        border: solid $accent;
+    }
+    """
+
+    def compose(self):
+        yield PreflightBar(id="preflight-bar")
+        yield CycleSummaryRow(id="cycle-row")
+        with Horizontal(id="main"):
+            with Vertical(id="left"):
+                yield Static("Findings (current cycle)", classes="panel-title")
+                yield DataTable(id="findings", zebra_stripes=True)
+                yield Static("Recent PRs (24h)", classes="panel-title")
+                yield DataTable(id="prs", zebra_stripes=True)
+            yield RichLog(id="daemon-log", wrap=True, highlight=True,
+                          markup=True, max_lines=5000)
+        yield Input(placeholder="repo path (press R to focus)", id="repo-input")
+
+    def on_mount(self) -> None:
+        from textual.css.query import NoMatches
+        try:
+            ftable = self.query_one("#findings", DataTable)
+            ftable.add_columns("bug_id", "severity", "status", "title")
+        except NoMatches:
+            pass
+        try:
+            ptable = self.query_one("#prs", DataTable)
+            ptable.add_columns("#", "state", "bug_id", "title")
+        except NoMatches:
+            pass
+        # Kick off preflight in the background; do not block on_mount
+        asyncio.create_task(self._run_preflight_async())
+
+    async def _run_preflight_async(self) -> None:
+        from pm_agent import preflight as _pf
+        from pm_agent.preflight import CheckResult
+        from pm_agent.loop import STATE_DB
+        try:
+            results, _ = await asyncio.to_thread(
+                _pf.run_preflight, STATE_DB, self.app.repo)
+        except Exception as e:
+            _logging.getLogger(__name__).exception("preflight crashed")
+            results = [CheckResult("preflight runner", False,
+                                   f"crashed: {e!r}")]
+        self.app.preflight_results = results
+        from textual.css.query import NoMatches
+        try:
+            self.query_one(PreflightBar).update_from(results)
+        except NoMatches:
+            pass
+
+    async def on_screen_resume(self) -> None:
+        from textual.css.query import NoMatches
+        # Replay buffered log lines
+        try:
+            log_w = self.query_one("#daemon-log", RichLog)
+            log_w.clear()
+            for line in list(self.app.log_buffer):
+                log_w.write(line)
+        except NoMatches:
+            pass
+        # Immediate refresh from DB
+        try:
+            await self.app.db_poller.tick_once()
+        except (AttributeError, asyncio.TimeoutError):
+            pass
+
+    def append_log_line(self, msg: str) -> None:
+        from textual.css.query import NoMatches
+        try:
+            self.query_one("#daemon-log", RichLog).write(msg)
+        except NoMatches:
+            pass
+
+    def update_cycle_and_findings(self, payload) -> None:
+        from textual.css.query import NoMatches
+        try:
+            self.query_one(CycleSummaryRow).update_from(payload)
+        except NoMatches:
+            pass
+        try:
+            ftable = self.query_one("#findings", DataTable)
+            ftable.clear()
+            for f in payload.findings:
+                ftable.add_row(f.bug_id, f.severity, f.status, f.title)
+        except NoMatches:
+            pass
+
+    def update_prs(self, rows) -> None:
+        from textual.css.query import NoMatches
+        try:
+            ptable = self.query_one("#prs", DataTable)
+            ptable.clear()
+            for r in rows:
+                ptable.add_row(
+                    f"#{r.github_number}", r.state, r.bug_id, r.title)
+        except NoMatches:
+            pass
+
+    # ── actions ────────────────────────────────────────────────────────
+
+    async def action_start_daemon(self) -> None:
+        from pm_agent import loop as _loop, persistence
+        log = _logging.getLogger("pm_agent.tui")
+        if self.app.daemon_task and not self.app.daemon_task.done():
+            self.app.notify("daemon already running"); return
+        if getattr(self.app, "daemon_starting", False):
+            self.app.notify("daemon already starting"); return
+        if self.app.preflight_results is None:
+            self.app.notify("preflight not yet run; press p first"); return
+
+        hard_fails = [
+            r for r in self.app.preflight_results
+            if not r.ok and not r.warn_only and r.name in HARD_CHECK_NAMES
+        ]
+        if hard_fails:
+            names = ", ".join(r.name for r in hard_fails)
+            self.app.notify(f"preflight failed: {names}", severity="error")
+            return
+
+        for r in self.app.preflight_results:
+            if (not r.ok and not r.warn_only
+                    and r.name not in HARD_CHECK_NAMES):
+                log.info("preflight soft-warn: %s — %s", r.name, r.message)
+
+        self.app.daemon_starting = True
+        try:
+            self.app.daemon_stop_event = asyncio.Event()
+            rec = await asyncio.to_thread(persistence.reconcile, self.app.repo)
+            log.info("reconcile: %s", rec)
+
+            self.app.daemon_last_error = None
+            from textual.css.query import NoMatches
+            try:
+                self.query_one(CycleSummaryRow).clear_last_error()
+            except NoMatches:
+                pass
+
+            self.app.daemon_task = asyncio.create_task(
+                _loop.run_forever(
+                    self.app.repo, self.app.loop_cfg,
+                    install_signal_handlers=False,
+                    skip_init=True, skip_reconcile=True,
+                    stop_event=self.app.daemon_stop_event,
+                ),
+                name="pm-agent-loop",
+            )
+            self.app.daemon_task.add_done_callback(self.app._on_daemon_done)
+        finally:
+            self.app.daemon_starting = False
+
+    async def action_stop_daemon(self) -> None:
+        if getattr(self.app, "daemon_starting", False):
+            self.app.notify("daemon still starting; try again in a moment")
+            return
+        t = self.app.daemon_task
+        if not t or t.done():
+            self.app.notify("no running daemon"); return
+        self.app.daemon_stop_event.set()
+        self.app.notify(
+            "stop signal sent; daemon will finish current cycle")
+
+    async def action_preflight(self) -> None:
+        await self._run_preflight_async()
+
+    def action_focus_repo(self) -> None:
+        if getattr(self.app, "is_daemon_active", False):
+            self.app.notify("stop daemon first to change repo")
+            return
+        from textual.css.query import NoMatches
+        try:
+            self.query_one("#repo-input", Input).focus()
+        except NoMatches:
+            pass
+
+    def action_blur_input(self) -> None:
+        from textual.css.query import NoMatches
+        try:
+            self.query_one("#repo-input", Input).blur()
+        except NoMatches:
+            pass
+
+    async def on_input_submitted(self, event):
+        if event.input.id != "repo-input":
+            return
+        new = Path(event.value).expanduser()
+        if not new.is_dir():
+            self.app.notify(f"not a directory: {new}", severity="error")
+            return
+        if not (new / ".git").is_dir():
+            self.app.notify(f"not a git repo: {new}", severity="error")
+            return
+        self.app.repo = new
+        _logging.getLogger("pm_agent.tui").info("repo switched to %s", new)
+        event.input.blur()
+        await self.action_preflight()
 
 
 def _ensure_target_repo(path: Path) -> Path:
