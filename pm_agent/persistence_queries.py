@@ -7,6 +7,7 @@ Pure functions that read the SQLite state DB initialized by
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 from pm_agent import persistence
@@ -114,3 +115,41 @@ def live_cycle() -> LiveCyclePayload:
         ],
         last_finished=_summarize_finished(c, last_finished_row),
     )
+
+
+@dataclass
+class PRRow:
+    github_number: int
+    state: str
+    action: str
+    url: str
+    created_at: str
+    bug_id: str
+    title: str
+    severity: str
+
+
+def recent_prs_24h() -> list[PRRow]:
+    """Last 24h PRs joined to findings, newest first, capped at 50.
+
+    `prs.created_at` is UTC ISO 8601 (string-sortable), so a `>=` string
+    comparison correctly implements the 24h cutoff.
+    """
+    c = persistence.get_conn()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    rows = c.execute(
+        """SELECT p.github_number, p.state, p.action, p.url, p.created_at,
+                  f.bug_id, f.title, f.severity
+           FROM prs p JOIN findings f ON p.finding_id = f.id
+           WHERE p.created_at >= ?
+           ORDER BY p.id DESC
+           LIMIT 50""",
+        (cutoff,),
+    ).fetchall()
+    return [
+        PRRow(
+            github_number=r["github_number"], state=r["state"],
+            action=r["action"], url=r["url"], created_at=r["created_at"],
+            bug_id=r["bug_id"], title=r["title"], severity=r["severity"],
+        ) for r in rows
+    ]
