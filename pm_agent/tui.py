@@ -1764,106 +1764,54 @@ def _ensure_target_repo(path: Path) -> Path:
 
 def main() -> None:
     ap = argparse.ArgumentParser(prog="pm-agent.tui")
-    ap.add_argument("goal", nargs="*", help="goal text (omit to enter mock mode)")
-    ap.add_argument(
-        "--repo",
-        type=Path,
-        default=Path("/tmp/pm-agent-day7-target"),
-        help="target git repo for worktrees (default: /tmp/pm-agent-day7-target, aligned with docs/demo-commands.sh)",
-    )
-    ap.add_argument(
-        "--single",
-        action="store_true",
-        help="single-coder mode (day 3-4 behavior); ignores planner decomposition",
-    )
-    ap.add_argument(
-        "--mock-planner",
-        action="store_true",
-        help="skip the real claude-driven planner, use the cheap mock fallback",
-    )
-    ap.add_argument(
-        "--test-cmd",
-        default=None,
-        help="shell command to run inside the integration worktree after a clean merge "
-             "(e.g. 'pytest tests/' or 'python3 -m unittest discover')",
-    )
-    ap.add_argument(
-        "--coder-timeout",
-        type=float,
-        default=180.0,
-        help="seconds before each Coder subprocess is killed (default: 180)",
-    )
-    ap.add_argument(
-        "--max-retries",
-        type=int,
-        default=2,
-        help="planner self-correcting retry budget (default: 2 = up to 3 attempts)",
-    )
-    ap.add_argument(
-        "--test-timeout",
-        type=float,
-        default=120.0,
-        help="seconds before integration test_cmd is killed (default: 120)",
-    )
-    ap.add_argument(
-        "--inject-fault",
-        choices=("planner-yaml", "coder-timeout", "api-error"),
-        default=None,
-        help="Day 11 demo: deterministically trigger an error path. "
-             "planner-yaml: every planner attempt fails parse, falling back "
-             "to mock_planner_decompose. "
-             "coder-timeout: every Coder yields a synthetic timeout event "
-             "(real timeout handler runs). "
-             "api-error: every Coder yields a synthetic rate-limit + "
-             "is_error result. "
-             "All three are free / deterministic — no extra claude tokens.",
-    )
-    ap.add_argument(
-        "--interactive", "-i",
-        action="store_true",
-        help="Day 15: show an input bar at the bottom; type goals and press "
-             "Enter to run them back-to-back. Initial goal arg is optional in "
-             "this mode — omit it to start at the input prompt.",
-    )
+    ap.add_argument("goal", nargs="*", default=None,
+                    help="goal text (omit to enter mock or interactive mode)")
+    ap.add_argument("--repo", default="/tmp/pm-agent-day7-target")
+    ap.add_argument("--daemon", action="store_true",
+                    help="boot directly into daemon mode")
+    ap.add_argument("--single", action="store_true",
+                    help="single-coder mode (day 3-4 behavior)")
+    ap.add_argument("--mock-planner", action="store_true",
+                    help="use mock planner fallback")
+    ap.add_argument("--test-cmd", default=None)
+    ap.add_argument("--coder-timeout", type=float, default=180.0)
+    ap.add_argument("--max-retries", type=int, default=2)
+    ap.add_argument("--test-timeout", type=float, default=120.0)
+    ap.add_argument("--inject-fault",
+                    choices=["planner-yaml", "coder-timeout", "api-error"],
+                    default=None)
+    ap.add_argument("--interactive", action="store_true")
     args = ap.parse_args()
 
-    goal = " ".join(args.goal).strip() or None
+    # Validation: preserve existing CLI safety from prior tui.py main()
+    if args.coder_timeout <= 0:
+        ap.error("--coder-timeout must be > 0")
+    if args.test_timeout <= 0:
+        ap.error("--test-timeout must be > 0")
 
-    # Mock mode: no goal AND not interactive.
-    if goal is None and not args.interactive:
-        _run_goal_only(goal=None)
-        return
+    from pm_agent.loop import LoopConfig
+    loop_cfg = LoopConfig(
+        coder_timeout=args.coder_timeout,
+        test_timeout=args.test_timeout,
+        max_retries=args.max_retries,
+    )
 
-    repo = _ensure_target_repo(args.repo)
-    _run_goal_only(
-        goal=goal,
-        repo=repo,
+    app = PMAgentTUI(
+        repo=Path(args.repo).expanduser(),
+        goal=" ".join(args.goal) if args.goal else None,
+        open_daemon=args.daemon,
+        loop_cfg=loop_cfg,
+        # remaining kwargs flow to GoalScreen via PMAgentTUI's _goal_kwargs:
         single=args.single,
         use_real_planner=not args.mock_planner,
         test_cmd=args.test_cmd,
         coder_timeout=args.coder_timeout,
-        inject_fault=args.inject_fault,
-        interactive=args.interactive,
         max_retries=args.max_retries,
         test_timeout=args.test_timeout,
+        inject_fault=args.inject_fault,
+        interactive=args.interactive,
     )
-
-
-def _run_goal_only(**screen_kwargs) -> None:
-    """Interim runner for Task 10-11: wraps ``GoalScreen`` in a bare App.
-
-    ``GoalScreen`` is a ``Screen``, not an ``App``, so it has no ``run()``
-    of its own. Task 12 replaces this with the full ``PMAgentTUI(App)``
-    that hosts both Goal and Daemon screens; until then, ``main()`` calls
-    this helper to keep ``python -m pm_agent.tui`` working.
-    """
-    from textual.app import App as _App
-
-    class _Wrapper(_App):
-        def on_mount(self) -> None:  # pragma: no cover - exercised manually
-            self.push_screen(GoalScreen(**screen_kwargs))
-
-    _Wrapper().run()
+    app.run()
 
 
 class PMAgentTUI(App):
