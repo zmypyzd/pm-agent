@@ -94,6 +94,92 @@ class TUILogHandler(_logging.Handler):
             screen.append_log_line(msg)
 
 
+class DbPoller:
+    """Polls SQLite on two cadences. Each tick wraps a sync query in
+    asyncio.to_thread; queries run on the default executor (≤32 workers,
+    each with its own thread-local SQLite connection)."""
+
+    LIVE_INTERVAL = 1.0
+    PRS_INTERVAL = 30.0
+    LIVE_TIMEOUT = 2.0
+    PRS_TIMEOUT = 10.0
+
+    def __init__(self, app):
+        self._app = app
+        self._live_task = None
+        self._prs_task = None
+
+    def start(self) -> None:
+        import asyncio as _aio
+        self._live_task = _aio.create_task(self._loop_live(), name="db-poller-live")
+        self._prs_task = _aio.create_task(self._loop_prs(),  name="db-poller-prs")
+
+    def stop(self) -> None:
+        for t in (self._live_task, self._prs_task):
+            if t is not None and not t.done():
+                t.cancel()
+
+    async def tick_once(self) -> None:
+        """Run one live + prs query immediately. Used by Screen resume."""
+        import asyncio as _aio
+        from pm_agent import persistence_queries as _q
+        live = await _aio.wait_for(
+            _aio.to_thread(_q.live_cycle), timeout=self.LIVE_TIMEOUT)
+        screen = self._current_daemon_screen()
+        if screen is not None:
+            screen.update_cycle_and_findings(live)
+        prs = await _aio.wait_for(
+            _aio.to_thread(_q.recent_prs_24h), timeout=self.PRS_TIMEOUT)
+        if screen is not None:
+            screen.update_prs(prs)
+
+    def _current_daemon_screen(self):
+        if not self._app.screen_stack:
+            return None
+        top = self._app.screen_stack[-1]
+        return top if isinstance(top, DaemonScreen) else None
+
+    async def _loop_live(self):
+        import asyncio as _aio
+        from pm_agent import persistence_queries as _q
+        while True:
+            try:
+                data = await _aio.wait_for(
+                    _aio.to_thread(_q.live_cycle), timeout=self.LIVE_TIMEOUT)
+                screen = self._current_daemon_screen()
+                if screen is not None:
+                    screen.update_cycle_and_findings(data)
+            except _aio.CancelledError:
+                raise
+            except sqlite3.OperationalError as e:
+                _logging.getLogger(__name__).warning("db poll (live) failed: %s", e)
+            except _aio.TimeoutError:
+                _logging.getLogger(__name__).warning("db poll (live) timeout")
+            except Exception:
+                _logging.getLogger(__name__).exception("db poller live tick crashed")
+            await _aio.sleep(self.LIVE_INTERVAL)
+
+    async def _loop_prs(self):
+        import asyncio as _aio
+        from pm_agent import persistence_queries as _q
+        while True:
+            try:
+                data = await _aio.wait_for(
+                    _aio.to_thread(_q.recent_prs_24h), timeout=self.PRS_TIMEOUT)
+                screen = self._current_daemon_screen()
+                if screen is not None:
+                    screen.update_prs(data)
+            except _aio.CancelledError:
+                raise
+            except sqlite3.OperationalError as e:
+                _logging.getLogger(__name__).warning("db poll (prs) failed: %s", e)
+            except _aio.TimeoutError:
+                _logging.getLogger(__name__).warning("db poll (prs) timeout")
+            except Exception:
+                _logging.getLogger(__name__).exception("db poller prs tick crashed")
+            await _aio.sleep(self.PRS_INTERVAL)
+
+
 GOAL_MOCK = "Add room invite link API to werewolf platform (mock)"
 
 # Day 10 polish: status icons + colors used by agent cards and task table.
