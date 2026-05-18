@@ -42,7 +42,7 @@ from pathlib import Path
 from rich.markup import escape as _rich_escape
 from rich.text import Text
 from textual import work
-from textual.app import ComposeResult
+from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import DataTable, Input, Label, ProgressBar, RichLog, Static
@@ -54,6 +54,7 @@ from pm_agent.worktree import IntegrationResult, WorktreeManager
 
 import collections
 import logging as _logging  # avoid clashing with the existing `log` variable used in this module
+import signal
 import sqlite3
 
 
@@ -1865,12 +1866,144 @@ def _run_goal_only(**screen_kwargs) -> None:
     _Wrapper().run()
 
 
-# TEMPORARY: replaced by the real App in Task 12. Keeps ``pm_agent.tui.main``
-# importable and ``tests/test_cli.py:212`` working until then. Existing
-# reproduction scripts that construct ``PMAgentTUI(goal=None)`` for inspection
-# also keep working because Screen accepts no positional args and stores the
-# legacy kwargs on ``self``.
-PMAgentTUI = GoalScreen
+class PMAgentTUI(App):
+    """Top-level Textual App. Wraps GoalScreen and DaemonScreen and holds
+    daemon-task / log-buffer / db-poller shared state."""
+
+    BINDINGS = [
+        ("g", "switch_screen('goal')",   "Goal mode"),
+        ("d", "switch_screen('daemon')", "Daemon mode"),
+        ("q", "request_quit",            "Quit"),
+    ]
+
+    DEFAULT_CSS = """
+    .panel-title {
+        text-style: bold;
+        background: $boost;
+        height: 1;
+        margin: 0 0 1 0;
+    }
+    """
+
+    def __init__(
+        self,
+        repo=None,
+        goal=None,
+        *,
+        open_daemon: bool = False,
+        loop_cfg=None,
+        **goal_kwargs,
+    ):
+        super().__init__()
+        self.repo = Path(repo) if repo is not None else Path("/tmp/pm-agent-day7-target")
+        self.goal = goal
+        self._open_daemon = open_daemon
+        self._goal_kwargs = goal_kwargs
+        # Initialize DB exactly once
+        from pm_agent import persistence
+        from pm_agent.loop import STATE_DB, LoopConfig
+        persistence.init_db(STATE_DB)
+        self.log_buffer = collections.deque(maxlen=2000)
+        self.daemon_task = None
+        self.daemon_starting = False
+        self.daemon_stop_event = None
+        self.daemon_last_error = None
+        self.preflight_results = None
+        self.loop_cfg = loop_cfg or LoopConfig()
+        self.log_handler = None
+        self.db_poller = None
+
+    @property
+    def is_daemon_active(self) -> bool:
+        return self.daemon_starting or (
+            self.daemon_task is not None and not self.daemon_task.done()
+        )
+
+    def on_mount(self) -> None:
+        loop = asyncio.get_running_loop()
+        root = _logging.getLogger()
+        # Remove any stale TUILogHandler from prior App instances (pytest)
+        for h in list(root.handlers):
+            if isinstance(h, TUILogHandler):
+                root.removeHandler(h)
+        self.log_handler = TUILogHandler(loop, self.log_buffer, self)
+        self.log_handler.setLevel(_logging.INFO)
+        self.log_handler.setFormatter(_logging.Formatter(
+            "%(asctime)s [%(name)s] %(levelname)s %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        root.addHandler(self.log_handler)
+        _logging.getLogger("textual").setLevel(_logging.WARNING)
+        _logging.getLogger("uvicorn").setLevel(_logging.WARNING)
+        _logging.getLogger("pm_agent").setLevel(_logging.INFO)
+
+        # Install screens (passing constructor args)
+        goal_screen = GoalScreen(
+            repo=self.repo, goal=self.goal, **self._goal_kwargs)
+        self.install_screen(goal_screen, name="goal")
+        self.install_screen(DaemonScreen(), name="daemon")
+
+        self.db_poller = DbPoller(self)
+        self.db_poller.start()
+
+        # Route SIGTERM through Textual exit
+        try:
+            loop.add_signal_handler(signal.SIGTERM, self.exit)
+        except (NotImplementedError, ValueError):
+            pass  # Windows / not main thread
+
+        self.push_screen("daemon" if self._open_daemon else "goal")
+
+    def on_unmount(self) -> None:
+        if self.log_handler is not None:
+            _logging.getLogger().removeHandler(self.log_handler)
+        if self.db_poller is not None:
+            self.db_poller.stop()
+
+    def _on_daemon_done(self, task) -> None:
+        try:
+            task.result()
+            self.daemon_last_error = None
+        except asyncio.CancelledError as e:
+            self.daemon_last_error = e
+        except Exception as e:
+            self.daemon_last_error = e
+        # SystemExit / KeyboardInterrupt are intentionally not caught here —
+        # they propagate to the event loop.
+        self.daemon_task = None
+        _logging.getLogger("pm_agent.tui").info(
+            "daemon stopped: %s", self.daemon_last_error or "clean")
+        # Tell CycleSummaryRow about the error
+        from textual.css.query import NoMatches
+        try:
+            for s in self.screen_stack:
+                if isinstance(s, DaemonScreen):
+                    row = s.query_one(CycleSummaryRow)
+                    if self.daemon_last_error is not None:
+                        row.set_last_error(self.daemon_last_error)
+                    else:
+                        row.clear_last_error()
+        except NoMatches:
+            pass
+
+    async def action_request_quit(self) -> None:
+        if self.daemon_task is not None and not self.daemon_task.done():
+            if self.daemon_stop_event is not None:
+                self.daemon_stop_event.set()
+            self.notify("draining daemon... (30s max)")
+            try:
+                await asyncio.wait_for(self.daemon_task, timeout=30)
+            except asyncio.TimeoutError:
+                self.daemon_task.cancel()
+                self.notify(
+                    "forced exit; worktree cleanup may be incomplete",
+                    severity="warning",
+                )
+                try:
+                    await self.daemon_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self.exit()
 
 
 if __name__ == "__main__":
