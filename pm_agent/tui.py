@@ -1601,6 +1601,17 @@ class DaemonScreen(Screen):
                 log_w.write(line)
         except NoMatches:
             pass
+        # If the daemon died while we were elsewhere, _on_daemon_done could not
+        # reach this Screen (it wasn't on the stack). Re-sync the banner now.
+        last_err = getattr(self.app, "daemon_last_error", None)
+        try:
+            row = self.query_one(CycleSummaryRow)
+            if last_err is not None:
+                row.set_last_error(last_err)
+            else:
+                row.clear_last_error()
+        except NoMatches:
+            pass
         # Immediate refresh from DB
         try:
             await self.app.db_poller.tick_once()

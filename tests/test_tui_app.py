@@ -72,6 +72,33 @@ async def test_on_daemon_done_captures_exception(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_daemon_crash_during_goal_mode_surfaces_on_resume(tmp_path):
+    """If daemon dies while user is on GoalScreen, the crashed banner must
+    appear when they switch back to DaemonScreen. See final-review finding."""
+    from pm_agent.tui import PMAgentTUI, DaemonScreen, CycleSummaryRow
+    async with PMAgentTUI(repo=tmp_path).run_test() as pilot:
+        await pilot.pause()
+        # Start on GoalScreen, simulate daemon crash via _on_daemon_done
+        async def crashed():
+            raise RuntimeError("simulated daemon crash")
+        t = asyncio.create_task(crashed())
+        with pytest.raises(RuntimeError):
+            await t
+        pilot.app.daemon_task = t
+        pilot.app._on_daemon_done(t)
+        assert isinstance(pilot.app.daemon_last_error, RuntimeError)
+
+        # Switch to DaemonScreen — on_screen_resume should now mirror the
+        # crash onto CycleSummaryRow.
+        await pilot.press("d")
+        await pilot.pause()
+        screen = pilot.app.screen_stack[-1]
+        assert isinstance(screen, DaemonScreen)
+        row = screen.query_one(CycleSummaryRow)
+        assert row._last_error is pilot.app.daemon_last_error
+
+
+@pytest.mark.asyncio
 async def test_tui_log_handler_removed_on_unmount(tmp_path):
     """Re-instantiating the App must not pile up handlers on the root logger."""
     import logging
