@@ -153,3 +153,58 @@ def recent_prs_24h() -> list[PRRow]:
             bug_id=r["bug_id"], title=r["title"], severity=r["severity"],
         ) for r in rows
     ]
+
+
+@dataclass
+class TrendPoint:
+    ts: str
+    findings_total: int
+    prs_opened: int
+    merges: int
+    cumulative_cost_usd: float
+
+
+@dataclass
+class TrendPayload:
+    points: list[TrendPoint] = field(default_factory=list)
+
+
+def trend_24h() -> TrendPayload:
+    """24h cumulative cost + per-cycle counts. Mirrors dashboard /api/trend."""
+    c = persistence.get_conn()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    cycles = c.execute(
+        """SELECT id, started_at, cost_usd FROM cycles
+           WHERE started_at >= ? ORDER BY started_at""",
+        (cutoff,),
+    ).fetchall()
+    cumulative = 0.0
+    points: list[TrendPoint] = []
+    for row in cycles:
+        cost = c.execute(
+            "SELECT COALESCE(SUM(usd),0) AS t FROM costs WHERE cycle_id=?",
+            (row["id"],),
+        ).fetchone()["t"]
+        cumulative += float(cost or 0)
+        findings_n = c.execute(
+            "SELECT COUNT(*) AS n FROM findings WHERE cycle_id=?", (row["id"],),
+        ).fetchone()["n"]
+        prs_n = c.execute(
+            """SELECT COUNT(*) AS n FROM prs p
+               JOIN findings f ON p.finding_id=f.id WHERE f.cycle_id=?""",
+            (row["id"],),
+        ).fetchone()["n"]
+        merges_n = c.execute(
+            """SELECT COUNT(*) AS n FROM prs p
+               JOIN findings f ON p.finding_id=f.id
+               WHERE f.cycle_id=? AND p.state='merged'""",
+            (row["id"],),
+        ).fetchone()["n"]
+        points.append(TrendPoint(
+            ts=row["started_at"],
+            findings_total=findings_n,
+            prs_opened=prs_n,
+            merges=merges_n,
+            cumulative_cost_usd=round(cumulative, 4),
+        ))
+    return TrendPayload(points=points)

@@ -117,3 +117,23 @@ def test_recent_prs_24h_order_desc_by_id(tmp_path):
     persistence.record_pr(fid, 3, "u", "open", "opened")
     rows = queries.recent_prs_24h()
     assert [r.github_number for r in rows] == [3, 2, 1]
+
+
+def test_trend_24h_empty(tmp_path):
+    persistence.init_db(tmp_path / "state.db")
+    payload = queries.trend_24h()
+    assert payload.points == []
+
+
+def test_trend_24h_cumulative_cost(tmp_path):
+    persistence.init_db(tmp_path / "state.db")
+    c1 = persistence.start_cycle()
+    persistence.record_cost(c1, "scanner", 0.10)
+    persistence.finish_cycle(c1, "done", 0.10)
+    c2 = persistence.start_cycle()
+    persistence.record_cost(c2, "scanner", 0.20)
+    persistence.finish_cycle(c2, "done", 0.20)
+    payload = queries.trend_24h()
+    assert len(payload.points) == 2
+    assert payload.points[0].cumulative_cost_usd == pytest.approx(0.10)
+    assert payload.points[1].cumulative_cost_usd == pytest.approx(0.30)
