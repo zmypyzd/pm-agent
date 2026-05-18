@@ -176,6 +176,50 @@ class DbPoller:
             await asyncio.sleep(self.PRS_INTERVAL)
 
 
+class PreflightBar(Static):
+    """One-row, seven-cell preflight status bar."""
+
+    DEFAULT_CSS = """
+    PreflightBar {
+        height: 1;
+        background: $panel;
+        padding: 0 1;
+    }
+    """
+
+    _markup: str = ""
+
+    @property
+    def renderable(self) -> str:
+        """Return the raw markup string; str(bar.renderable) includes color tags."""
+        return self._markup
+
+    def update_from(self, results) -> None:
+        """Replace bar content with rendered cells.
+
+        `results` is the list returned by `preflight.run_preflight(...)[0]`.
+        """
+        cells = []
+        for r in results:
+            if r.ok:
+                symbol, color = "✓", "green"
+            elif r.warn_only:
+                symbol, color = "⚠", "yellow"
+            else:
+                symbol, color = "✗", "red"
+            # Shorten name to ≤14 chars to keep 7 cells on one row
+            short = (
+                r.name
+                .replace("state.db ", "db ")
+                .replace("repo on main", "main")
+                .replace("claude CLI on PATH", "claude")
+                .replace("gh CLI authenticated", "gh")
+            )
+            cells.append(f"[{color}]{symbol} {short}[/]")
+        self._markup = " │ ".join(cells)
+        self.update(self._markup)
+
+
 GOAL_MOCK = "Add room invite link API to werewolf platform (mock)"
 
 # Day 10 polish: status icons + colors used by agent cards and task table.
