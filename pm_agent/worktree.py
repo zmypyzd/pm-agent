@@ -15,6 +15,7 @@ import fcntl
 import os
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -72,6 +73,11 @@ class WorktreeManager:
         # against the same repo (BUG-008). Held for the lifetime of the
         # WorktreeManager — fcntl flocks release on close()/process exit.
         self._lock_fh = None  # set lazily in _acquire_lock
+        # Guards the lazy init of _lock_fh against in-process races. Parallel
+        # coders call acreate() via asyncio.to_thread on separate worker
+        # threads; without this both pass the `is None` guard, both open
+        # the lock file, and the second flock(LOCK_NB) raises BlockingIOError.
+        self._init_lock = threading.Lock()
 
     def _detect_base_branch(self) -> str:
         try:
@@ -93,19 +99,24 @@ class WorktreeManager:
         """Take an exclusive flock on .pm-agent-worktrees/.lock so two
         pm-agent instances on the same repo can't race on worktree creation
         (BUG-008). Best-effort: silently degrades on filesystems where
-        flock isn't supported."""
+        flock isn't supported. Double-checked locking under self._init_lock
+        keeps in-process concurrent acreate() calls from both trying to
+        flock the same file."""
         if self._lock_fh is not None:
             return
-        self.worktrees_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = self.worktrees_dir / ".lock"
-        try:
-            fh = open(lock_path, "w")
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self._lock_fh = fh
-        except (OSError, BlockingIOError) as e:
-            raise WorktreeError(
-                f"another pm-agent instance is using {self.repo_root}: {e}"
-            ) from e
+        with self._init_lock:
+            if self._lock_fh is not None:
+                return
+            self.worktrees_dir.mkdir(parents=True, exist_ok=True)
+            lock_path = self.worktrees_dir / ".lock"
+            try:
+                fh = open(lock_path, "w")
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._lock_fh = fh
+            except (OSError, BlockingIOError) as e:
+                raise WorktreeError(
+                    f"another pm-agent instance is using {self.repo_root}: {e}"
+                ) from e
 
     def diff_against_base(self, task_id: str) -> str:
         """Return `git diff <base>..<task_branch>` as a unified diff string.

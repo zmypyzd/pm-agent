@@ -315,6 +315,7 @@ AGENTS_INITIAL = [
     ("Planner",  "done",     "Decomposed into 3 tasks"),
     ("Coder-1",  "running",  "Editing server/rooms/api.py"),
     ("Coder-2",  "running",  "Writing tests for invite expiry"),
+    ("Reviewer", "idle",     "waiting for coders"),
 ]
 
 TASKS_MOCK = [
@@ -534,6 +535,11 @@ class GoalScreen(Screen):
         self._artifacts_dir: Path = ARTIFACTS_ROOT / self._run_id
         self._task_diffs: dict[str, str] = {}
         self._task_errors: dict[str, str] = {}
+        # Per-task terminal status. Populated by _mark_terminal() — the only
+        # source of truth for "did this task actually finish successfully".
+        # Keys: "done" | "failed" | "timeout" | "api_error". Tasks absent
+        # from this dict never reached a terminal state (e.g. cancelled).
+        self._task_terminal_status: dict[str, str] = {}
         self._rate_limit_events: list[dict] = []
         self._integration: IntegrationResult | None = None
 
@@ -674,6 +680,7 @@ class GoalScreen(Screen):
 
             if not self._tasks:
                 self._log("[red]no tasks to run; aborting session[/]")
+                self._set_agent_status("Reviewer", "idle", "(no tasks)")
                 return
 
             # Idle any preallocated Coder slot we won't use this run. The TUI
@@ -692,7 +699,10 @@ class GoalScreen(Screen):
             for t, r in zip(self._tasks, results):
                 if isinstance(r, Exception):
                     self._log(f"[red][{t.id}] failed: {r}[/]")
-                    self._update_task_status(t.id, "failed")
+                    self._mark_terminal(t.id, "failed")
+                    self._task_errors[t.id] = (
+                        f"{type(r).__name__}: {str(r)[:280]}"
+                    )
                     self._set_agent_status(
                         self._coder_card(t.id), "failed", f"{t.id} crashed"
                     )
@@ -703,9 +713,38 @@ class GoalScreen(Screen):
                 f"in {time.time() - self._start_time:.1f}s"
             )
 
-            # Step 3: integration (skip --single mode; nothing to merge)
+            # Step 3: integration (skip --single mode; nothing to merge).
+            # Only merge tasks that reached the "done" terminal status —
+            # otherwise we'd ask git to merge a branch that was never
+            # created (crash / timeout / spawn error) and the result is
+            # the misleading "not something we can merge" error.
             if not self.single and self.wm and self._tasks:
-                await self._run_integration()
+                successful = [
+                    t for t in self._tasks
+                    if self._task_terminal_status.get(t.id) == "done"
+                ]
+                skipped = [
+                    t.id for t in self._tasks
+                    if self._task_terminal_status.get(t.id) != "done"
+                ]
+                if skipped:
+                    self._log(
+                        f"[yellow][Integrator] skipping {len(skipped)} "
+                        f"non-successful task(s): {', '.join(skipped)}[/]"
+                    )
+                if successful:
+                    await self._run_integration(successful)
+                else:
+                    self._log(
+                        "[yellow][Integrator] no successful tasks to merge[/]"
+                    )
+                    self._set_agent_status(
+                        "Reviewer", "idle", "(no successful tasks)"
+                    )
+            else:
+                self._set_agent_status(
+                    "Reviewer", "idle", "(skipped — single coder)"
+                )
 
             summary_path = self._write_run_summary()
             self._log(f"[bold green]→ run summary:[/] {summary_path}")
@@ -714,20 +753,28 @@ class GoalScreen(Screen):
             await self._cleanup_branches()
             self._session_complete = True
 
-    async def _run_integration(self) -> None:
+    async def _run_integration(self, tasks: list[CoderTask] | None = None) -> None:
         assert self.wm is not None
+        # Default to self._tasks for backwards compat (tests / external
+        # callers); _run_session always passes the filtered list explicitly.
+        tasks = tasks if tasks is not None else self._tasks
+        self._set_agent_status(
+            "Reviewer", "running",
+            f"merging {len(tasks)} branch(es)",
+        )
         self._log(
             f"[bold cyan][Integrator][/] merging "
-            f"{', '.join(t.id for t in self._tasks)} into "
+            f"{', '.join(t.id for t in tasks)} into "
             f"ai/integration/{self._run_id}"
         )
         try:
             self._integration = await self.wm.aintegrate(
-                self._run_id, [t.id for t in self._tasks],
+                self._run_id, [t.id for t in tasks],
                 test_cmd=self.test_cmd, test_timeout=self.test_timeout,
             )
         except Exception as e:
             self._log(f"[red][Integrator] crashed:[/] {type(e).__name__}: {_safe(e)}")
+            self._set_agent_status("Reviewer", "failed", "integrator crashed")
             return
 
         ig = self._integration
@@ -738,6 +785,9 @@ class GoalScreen(Screen):
             )
             for c in ig.conflicts:
                 self._log(f"[red]  {c['task_id']}: {c['output'].splitlines()[0][:100]}[/]")
+            self._set_agent_status(
+                "Reviewer", "failed", f"{len(ig.conflicts)} conflict(s)",
+            )
         else:
             self._log(
                 f"[green][Integrator] ✓ merged {len(ig.merged_tasks)} branch(es) clean[/]"
@@ -746,6 +796,10 @@ class GoalScreen(Screen):
             self._log(
                 f"[dim][Integrator] integrated diff: "
                 f"+{stats['added']} -{stats['removed']} in {stats['files']} file(s)[/]"
+            )
+            self._set_agent_status(
+                "Reviewer", "running",
+                f"merged {len(ig.merged_tasks)}, running tests",
             )
 
         if ig.test_result is not None:
@@ -756,6 +810,16 @@ class GoalScreen(Screen):
                 f"[bold {colour}][Integrator] tests "
                 f"{'PASS' if ok else 'FAIL'}[/] "
                 f"({tr['command']!r} → exit {tr['exit_code']})"
+            )
+            if not ig.conflicts:
+                self._set_agent_status(
+                    "Reviewer",
+                    "done" if ok else "failed",
+                    f"tests {'PASS' if ok else 'FAIL'}",
+                )
+        elif not ig.conflicts:
+            self._set_agent_status(
+                "Reviewer", "done", f"merged {len(ig.merged_tasks)} branch(es)",
             )
 
         # Save the integrated diff as an artifact
@@ -967,7 +1031,7 @@ class GoalScreen(Screen):
                         self._log(
                             f"[dim][{task.id}] cost=${float(cost):.4f} dur={dur}ms[/]"
                         )
-                        self._update_task_status(task.id, "api_error")
+                        self._mark_terminal(task.id, "api_error")
                         self._set_agent_status(
                             coder_card, "failed", f"{task.id}: API error"
                         )
@@ -980,7 +1044,7 @@ class GoalScreen(Screen):
                             f"cost=${float(cost):.4f} dur={dur}ms"
                         )
                         self._tasks_done += 1
-                        self._update_task_status(task.id, "done")
+                        self._mark_terminal(task.id, "done")
                         self._set_agent_status(
                             coder_card, "done", f"{task.id}: complete"
                         )
@@ -1004,7 +1068,7 @@ class GoalScreen(Screen):
                         f"[red][{_safe(task.id)}] ✗ TIMEOUT after {elapsed_s}s — "
                         f"subprocess killed[/]"
                     )
-                    self._update_task_status(task.id, "timeout")
+                    self._mark_terminal(task.id, "timeout")
                     self._set_agent_status(
                         coder_card, "failed", f"{task.id}: timeout"
                     )
@@ -1020,7 +1084,8 @@ class GoalScreen(Screen):
                     self._log(
                         f"[red][{_safe(task.id)}] ✗ spawn error:[/] {_safe(err)}"
                     )
-                    self._update_task_status(task.id, "failed")
+                    self._task_errors[task.id] = str(err)[:300]
+                    self._mark_terminal(task.id, "failed")
                     self._set_agent_status(
                         coder_card, "failed", f"{task.id}: spawn error"
                     )
@@ -1149,15 +1214,32 @@ class GoalScreen(Screen):
                     f"(of {len(self._rate_limit_events)} total)"
                 )
 
+        # Honest status badges (Bug 3): read from _task_terminal_status,
+        # which is the only source-of-truth for "did this task finish?".
+        # A missing entry means the task never reached a terminal state
+        # (cancelled / orchestrator crashed before result).
+        _STATUS_BADGE = {
+            "done":      "✓ done",
+            "failed":    "❌ FAILED",
+            "timeout":   "⏱️ TIMEOUT",
+            "api_error": "❌ API ERROR",
+        }
         for t in self._tasks:
             diff = self._task_diffs.get(t.id, "")
             stats = self._diff_stats(diff) if diff else {"added": 0, "removed": 0, "files": 0}
             err = self._task_errors.get(t.id)
-            status_str = "❌ API ERROR" if err else "✓ done"
+            term = self._task_terminal_status.get(t.id)
+            status_str = _STATUS_BADGE.get(term, "⚠ NO TERMINAL STATE")
+            # Only claim a branch when the task actually produced one.
+            branch_line = (
+                f"- **branch**: ai/{t.id}"
+                if term == "done"
+                else f"- **branch**: ai/{t.id} _(not created — task did not complete)_"
+            )
             out += [
                 f"## {t.id}: {t.title}  ({status_str})",
                 "",
-                f"- **branch**: ai/{t.id}",
+                branch_line,
                 f"- **diff**: +{stats['added']} -{stats['removed']} lines, {stats['files']} file(s)",
                 f"- **allowed_paths**: {', '.join(t.allowed_paths) or '(none)'}",
             ]
@@ -1283,13 +1365,27 @@ class GoalScreen(Screen):
         return task_id.replace("T-", "Coder-")
 
     def _log(self, msg: str) -> None:
-        """RichLog.write with a left-aligned HH:MM:SS timestamp prefix."""
+        """RichLog.write with a left-aligned HH:MM:SS timestamp prefix.
+        Also appends a markup-stripped line to <artifacts_dir>/live.log so
+        the session can be reconstructed after the TUI exits (Bug 4)."""
+        ts = time.strftime("%H:%M:%S")
+        self._log_to_file(ts, msg)
         try:
             log = self.query_one("#logs", RichLog)
         except Exception:
             return
-        ts = time.strftime("%H:%M:%S")
         log.write(f"[dim]{ts}[/] {msg}")
+
+    def _log_to_file(self, ts: str, msg: str) -> None:
+        """Append `<ts> <plain msg>` to <artifacts_dir>/live.log. Best
+        effort — never raises, the in-memory RichLog is the primary sink."""
+        try:
+            self._artifacts_dir.mkdir(parents=True, exist_ok=True)
+            plain = Text.from_markup(msg).plain
+            with (self._artifacts_dir / "live.log").open("a", encoding="utf-8") as fh:
+                fh.write(f"{ts} {plain}\n")
+        except Exception:
+            pass
 
     @staticmethod
     def _agent_card_text(name: str, status: str, action: str) -> str:
@@ -1324,6 +1420,17 @@ class GoalScreen(Screen):
             table.update_cell(rk, self._col_status, self._status_cell(status))
         except Exception:
             pass  # best-effort; agent cards are the primary visual cue
+
+    def _mark_terminal(self, task_id: str, status: str) -> None:
+        """Record a task's terminal outcome AND update the table cell.
+
+        Use this instead of _update_task_status whenever the new status is
+        terminal (done / failed / timeout / api_error). _run_integration and
+        _write_run_summary read self._task_terminal_status to know which
+        tasks actually produced a usable branch.
+        """
+        self._task_terminal_status[task_id] = status
+        self._update_task_status(task_id, status)
 
     def _set_agent_status(self, name: str, status: str, action: str) -> None:
         try:
@@ -1367,6 +1474,7 @@ class GoalScreen(Screen):
         self._streamed_text = ""
         self._task_diffs = {}
         self._task_errors = {}
+        self._task_terminal_status = {}
         self._rate_limit_events = []
         self._integration = None
         self._session_complete = False
