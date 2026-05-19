@@ -503,7 +503,7 @@ class GoalScreen(Screen):
         single: bool = False,
         use_real_planner: bool = True,
         test_cmd: str | None = None,
-        coder_timeout: float = 180.0,
+        coder_timeout: float = 36000.0,
         inject_fault: str | None = None,
         interactive: bool = False,
         max_retries: int = 2,
@@ -1892,7 +1892,7 @@ def main() -> None:
     ap.add_argument("--mock-planner", action="store_true",
                     help="use mock planner fallback")
     ap.add_argument("--test-cmd", default=None)
-    ap.add_argument("--coder-timeout", type=float, default=180.0)
+    ap.add_argument("--coder-timeout", type=float, default=36000.0)
     ap.add_argument("--max-retries", type=int, default=2)
     ap.add_argument("--test-timeout", type=float, default=120.0)
     ap.add_argument("--inject-fault",
