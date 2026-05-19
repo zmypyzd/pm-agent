@@ -42,7 +42,7 @@ class LoopConfig:
     interval_s: int = 1800
     max_retries: int = 2
     test_timeout: float = 120
-    coder_timeout: float = 36000
+    coder_timeout: float = 7200
     blocklist: tuple[str, ...] = field(default_factory=lambda: (
         ".git/*", ".github/*", ".teamagent/*", "pyproject.toml",
     ))

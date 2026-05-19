@@ -225,8 +225,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser, a
                             help="cycle interval in seconds (min 60, default: 1800)")
     p_loop_run.add_argument("--max-retries", type=_nonneg_int_type, default=2,
                             help="retries per finding (0 = never retry, default: 2)")
-    p_loop_run.add_argument("--coder-timeout", type=_coder_timeout_type, default=36000.0,
-                            help="coder subprocess timeout in seconds (min 30, default: 36000)")
+    p_loop_run.add_argument("--coder-timeout", type=_coder_timeout_type, default=7200.0,
+                            help="coder subprocess timeout in seconds (min 30, default: 7200)")
     p_loop_run.add_argument("--test-timeout", type=_test_timeout_type, default=120.0,
                             help="test subprocess timeout in seconds (min 30, default: 120)")
     sub_loop.add_parser("status", help="show current running cycle")
