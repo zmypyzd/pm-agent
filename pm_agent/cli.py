@@ -267,6 +267,21 @@ def _build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser, a
 
 
 def main() -> int:
+    # Short-circuit `pm-agent tui ...` BEFORE argparse runs.
+    # argparse.REMAINDER does not reliably capture `--flag` tokens at a
+    # subparser boundary — the top-level parser tries to interpret them
+    # and fails. Manually slurp everything after "tui" instead.
+    argv = sys.argv[1:]
+    if argv and argv[0] == "tui":
+        from pm_agent.tui import main as tui_main
+        old_argv = sys.argv
+        sys.argv = ["pm-agent"] + argv[1:]
+        try:
+            tui_main()
+        finally:
+            sys.argv = old_argv
+        return 0
+
     ap, p_loop, p_dash = _build_parser()
     args = ap.parse_args()
     if args.cmd is None:
